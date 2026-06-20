@@ -55,9 +55,11 @@ class HyperliquidDataFetcher:
             data = resp.json()
             prices = {}
             for sym in symbols:
-                key = f"{sym}-USDC"
-                if key in data:
-                    prices[sym] = float(data[key])
+                # Hyperliquid uses bare symbol names now (e.g. "BTC" not "BTC-USDC")
+                if sym in data:
+                    prices[sym] = float(data[sym])
+                elif f"{sym}-USDC" in data:
+                    prices[sym] = float(data[f"{sym}-USDC"])
             return prices
         except Exception as e:
             logger.warning(f"Hyperliquid price fetch failed: {e}")
@@ -74,10 +76,12 @@ class HyperliquidDataFetcher:
                 self.BASE_URL,
                 json={
                     "type": "candleSnapshot",
-                    "coin": f"{symbol}-USDC",
-                    "interval": interval,
-                    "startTime": start_time,
-                    "endTime": end_time,
+                    "req": {
+                        "coin": symbol,
+                        "interval": interval,
+                        "startTime": start_time,
+                        "endTime": end_time,
+                    }
                 },
                 timeout=15,
             )
@@ -153,6 +157,18 @@ class BinanceDataFetcher:
         "NATGAS": "NATGASUSDT",
         "PAXG": "PAXGUSDT",
         "SPX": "1000SHEES",
+        "BTC": "BTCUSDT",
+        "ETH": "ETHUSDT",
+        "SOL": "SOLUSDT",
+        "DOGE": "DOGEUSDT",
+        "WIF": "WIFUSDT",
+        "JUP": "JUPUSDT",
+        "RENDER": "RENDERUSDT",
+        "SUI": "SUIUSDT",
+        "LINK": "LINKUSDT",
+        "NEAR": "NEARUSDT",
+        "AAVE": "AAVEUSDT",
+        "FET": "FETUSDT",
     }
 
     def __init__(self):
@@ -330,14 +346,21 @@ class GrowthOrchestrator:
             age = now - pos.entry_time
             self.strategy.update_position_tracking(symbol, pos.pnl / pos.size_usd if pos.size_usd > 0 else 0, age)
 
-        # 6. Fetch historical data for signals (every 10 ticks)
+        # 6. Fetch historical data for signals (every 3 ticks for crypto)
         historical_data = {}
-        if self._tick_count % 10 == 0 or not hasattr(self, "_last_historical"):
-            for sym in list(crypto_prices.keys())[:5]:  # Top 5 crypto
+        if self._tick_count % 3 == 0 or not hasattr(self, "_last_historical"):
+            # Prioritize crypto - fetch ALL crypto assets from Hyperliquid
+            for sym in crypto_prices.keys():
                 candles = self.hyperliquid.get_candles(sym, "1h", 100)
                 if candles is not None:
                     historical_data[sym] = candles
+                else:
+                    # Fallback to Binance for crypto
+                    candles = self.binance.get_candles(sym, "1h", 100)
+                    if candles is not None:
+                        historical_data[sym] = candles
 
+            # Also fetch commodity data
             for sym in COMMODITY_ASSETS:
                 candles = self.binance.get_candles(sym, "1h", 100)
                 if candles is not None:

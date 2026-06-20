@@ -6,7 +6,7 @@ Enforces:
   - 6-hour maximum hold time
   - 20% daily loss limit
   - Correlation-based position limits
-  - Max position count (5)
+  - Max position count (7)
 """
 
 from __future__ import annotations
@@ -48,10 +48,10 @@ class GrowthRiskManager:
         self.max_position_loss_pct = self.config.get("max_position_loss_pct", 0.03)
         self.trailing_stop_pct = self.config.get("trailing_stop_pct", 0.015)
         self.max_hold_seconds = self.config.get("max_hold_seconds", 6 * 3600)  # 6 hours
-        self.max_positions = self.config.get("max_positions", 5)
+        self.max_positions = self.config.get("max_positions", 7)
 
         # Correlation limits
-        self.max_correlated_positions = self.config.get("max_correlated_positions", 2)
+        self.max_correlated_positions = self.config.get("max_correlated_positions", 3)
 
         # State
         self._daily_loss = 0.0

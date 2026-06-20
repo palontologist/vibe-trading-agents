@@ -62,10 +62,10 @@ class GrowthPortfolio:
         self.config = config or {}
         self.initial_cash = self.config.get("initial_cash", 10.0)
         self.leverage = self.config.get("leverage", 10.0)
-        self.max_positions = self.config.get("max_positions", 5)
+        self.max_positions = self.config.get("max_positions", 7)
         self.max_position_pct = self.config.get("max_position_pct", 0.80)
         self.min_order_usd = self.config.get("min_order_usd", 1.0)
-        self.kelly_fraction = self.config.get("kelly_fraction", 0.25)  # Quarter-Kelly
+        self.kelly_fraction = self.config.get("kelly_fraction", 0.40)  # Half-Kelly for aggression
 
         # Fee model (Hyperliquid-style)
         self.taker_fee = self.config.get("taker_fee", 0.0005)  # 0.05%

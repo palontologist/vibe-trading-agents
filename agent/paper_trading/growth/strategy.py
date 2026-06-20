@@ -77,8 +77,8 @@ class GrowthStrategy:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
-        self.min_confidence = self.config.get("min_confidence", 45)
-        self.min_confluence = self.config.get("min_confluence", 0.25)
+        self.min_confidence = self.config.get("min_confidence", 40)
+        self.min_confluence = self.config.get("min_confluence", 0.20)
         self.lookback = self.config.get("lookback", 50)
 
         # Signal weights (sum to 1.0)
@@ -492,11 +492,13 @@ class GrowthStrategy:
             else:
                 action = "SHORT"
             # Position sizing scales with confidence
-            size_pct = min(0.80, 0.40 + (avg_confidence - 50) / 100)
+            size_pct = min(0.85, 0.50 + (avg_confidence - 50) / 80)
 
         # Dynamic sizing based on day progress (compound more as we approach target)
+        if day_progress > 0.5:
+            size_pct = min(0.90, size_pct * 1.3)
         if day_progress > 0.7:
-            size_pct = min(0.85, size_pct * 1.2)
+            size_pct = min(0.95, size_pct * 1.5)
 
         # Set stops
         stop_loss = 0.03 if action != "FLAT" else 0.0  # 3% hard stop

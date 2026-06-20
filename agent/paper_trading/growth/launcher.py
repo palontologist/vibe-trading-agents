@@ -46,8 +46,8 @@ def main():
         "crypto_interval": int(os.environ.get("TICK_INTERVAL", "15")),
         "run_dir": os.environ.get("RUN_DIR", "./paper_runs/growth"),
         "strategy": {
-            "min_confidence": 45,
-            "min_confluence": 0.25,
+            "min_confidence": 40,
+            "min_confluence": 0.20,
             "signal_weights": {
                 "sentiment": 0.25,
                 "momentum": 0.25,
@@ -59,9 +59,9 @@ def main():
         "portfolio": {
             "initial_cash": float(os.environ.get("INITIAL_CASH", "10")),
             "leverage": float(os.environ.get("LEVERAGE", "10")),
-            "max_positions": 5,
-            "max_position_pct": 0.80,
-            "kelly_fraction": 0.25,
+            "max_positions": 7,
+            "max_position_pct": 0.85,
+            "kelly_fraction": 0.40,
         },
         "risk": {
             "max_daily_loss_pct": 0.20,
@@ -69,7 +69,8 @@ def main():
             "max_position_loss_pct": 0.03,
             "trailing_stop_pct": 0.015,
             "max_hold_seconds": 6 * 3600,
-            "max_positions": 5,
+            "max_positions": 7,
+            "max_correlated_positions": 3,
         },
     }
 
