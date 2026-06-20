@@ -35,6 +35,7 @@ Built on top of [HKUDS/Vibe-Trading](https://github.com/HKUDS/Vibe-Trading), thi
 | **Forex Paper Trading** | Real ECB data (Frankfurter API) for USD/MXN, BRL, ZAR, NZD, HUF, MYR, PLN with simulated intraday volatility |
 | **Multi-Exchange Support** | Simultaneous trading on Binance (XAU, XAG, NATGAS) and Hyperliquid (PAXG, SPX) |
 | **Aggressive Forex Scalper** | 10x leverage, 60% position sizing, RSI+Bollinger signals, targeting volatile exotic pairs |
+| **Growth Framework** | $10 → $10K target: 5-signal confluence, Kelly sizing, daily compounding, multi-asset |
 | **Wallet Connector** | Read-only Base wallet integration for on-chain balance monitoring |
 | **Live Hyperliquid Execution** | 74 real orders executed on Hyperliquid mainnet across 7 assets |
 | **Performance Report** | Full agent scorecard with PnL analysis, bias detection, and improvement areas |
@@ -149,6 +150,43 @@ USD/MXN LONG @ 17.3369 — $60 notional (60% of equity), 10x leverage.
 
 ---
 
+## Growth Framework: $10 → $10,000 in 10 Days
+
+Aggressive multi-signal system targeting 100% daily compounding through high-leverage, multi-asset trading.
+
+### Signal Stack (5 Layers)
+
+| Signal | Weight | Logic |
+|--------|--------|-------|
+| **Sentiment Contrarian** | 25% | F&G < 25 → contrarian LONG, F&G > 75 → contrarian SHORT |
+| **Momentum** | 25% | MA crossover + RSI(14) confirmation |
+| **Breakout** | 20% | Bollinger squeeze + volume surge detection |
+| **Rotation** | 15% | Weakest performer exit, high-beta entry (6h forced close) |
+| **Factor Alpha** | 15% | Cross-sectional momentum/volatility ranking |
+
+### Risk Controls
+
+| Rule | Threshold |
+|------|-----------|
+| Hard stop loss | -3% |
+| Trailing stop | -1.5% from peak |
+| Max hold time | 6 hours |
+| Daily loss limit | -20% |
+| Circuit breaker | -30% drawdown |
+| Max positions | 5 |
+
+### Quick Start
+
+```bash
+cd agent
+python -m paper_trading.growth.backtest    # Validate first
+python -m paper_trading.growth.launcher    # Run live paper
+```
+
+**Full documentation**: [GROWTH_FRAMEWORK.md](GROWTH_FRAMEWORK.md)
+
+---
+
 ## Data Sources
 
 | Source | Markets | Method |
@@ -187,7 +225,14 @@ vibe-trading --swarm-presets    # List available agent teams
 ```
 Vibe-Trading/
 ├── agent/
-│   ├── paper_trading/          # Paper trading system (28 modules)
+│   ├── paper_trading/          # Paper trading system (28+ modules)
+│   │   ├── growth/             # $10 → $10K Growth Framework
+│   │   │   ├── strategy.py     # 5-signal confluence engine
+│   │   │   ├── portfolio.py    # Kelly criterion sizing
+│   │   │   ├── risk.py         # Trailing stops, hard stops, limits
+│   │   │   ├── orchestrator.py # Continuous trading loop
+│   │   │   ├── launcher.py     # Entry point
+│   │   │   └── backtest.py     # Historical validation
 │   │   ├── multi_agent.py          # 5-agent orchestration framework
 │   │   ├── realtime_orchestrator.py # Continuous autonomous trading loop
 │   │   ├── forex_paper_launcher.py  # Multi-exchange commodity trader
@@ -198,12 +243,14 @@ Vibe-Trading/
 │   │   ├── hyperliquid_executor.py # Live Hyperliquid execution
 │   │   └── agent_scorecard.py      # Performance scoring
 │   ├── paper_runs/             # Paper trade logs & equity curves
-│   │   ├── forex_commodity/       # Commodity paper runs
-│   │   └── aggressive_forex/      # Forex paper runs
+│   │   ├── growth/             # Growth framework logs
+│   │   ├── forex_commodity/    # Commodity paper runs
+│   │   └── aggressive_forex/   # Forex paper runs
 │   ├── backtest_runs/          # Backtest results
 │   ├── src/                    # Core trading source
 │   └── backtest/               # Backtest engine
 ├── frontend/                   # React Web UI
+├── GROWTH_FRAMEWORK.md         # $10 → $10K documentation
 ├── paper_requirements.txt      # Paper trading dependencies
 ├── run-vibe-trading.sh         # Systemd launcher script
 └── vibe-trading.service        # Systemd service file
@@ -246,6 +293,8 @@ journalctl -u vibe-trading -f
 - [ ] Integrate real-time forex data (OANDA / Alpha Vantage API)
 - [ ] Track live trade PnL on-chain
 - [ ] Add correlation-based position limits
+- [x] **Growth Framework** — 5-signal confluence, Kelly sizing, $10→$10K target
+- [ ] Upstream integration — Alpha Zoo (456 factors), 18 data sources, 10 brokers
 
 ---
 
@@ -266,6 +315,10 @@ export INITIAL_CASH=10
 export LEVERAGE=10
 export DAILY_TARGET=5
 export TICK_INTERVAL=30
+
+# Growth Framework ($10 → $10K)
+export TARGET_EQUITY=10000
+export TARGET_DAYS=10
 ```
 
 ### Paper Trading Config
@@ -292,4 +345,21 @@ MIT — see [LICENSE](LICENSE)
 
 ---
 
-*Forked from [HKUDS/Vibe-Trading](https://github.com/HKUDS/Vibe-Trading) v0.1.7 — extended with paper trading, live execution, and forex capabilities.*
+*Forked from [HKUDS/Vibe-Trading](https://github.com/HKUDS/Vibe-Trading) v0.1.7 — extended with paper trading, live execution, forex capabilities, and growth framework.*
+
+---
+
+## Upstream Exploration (v0.1.7 → v0.1.10)
+
+Inspected 234 new commits from upstream HKUDS/Vibe-Trading. Key additions not yet integrated:
+
+| Feature | Description | Status |
+|---------|-------------|--------|
+| **Alpha Zoo** | 456 pre-built quant factors (Qlib158, Alpha101, GTJA191, Academic) | Explored |
+| **Global Data Layer** | 18 OHLCV sources (Eastmoney, Sina, Stooq, Finnhub, Alpha Vantage, Tiingo, FMP) | Explored |
+| **10 Broker Connectors** | Alpaca, Binance, OKX, Tiger, Longbridge, Futu, Dhan, Shoonya, IBKR, Robinhood | Explored |
+| **Live Trading Runtime** | Persistent runner, job scheduling, mandate system, enforcement | Explored |
+| **Research Autopilot** | Hypothesis → signal engine → backtest loop | Explored |
+| **Security Hardening** | Scanner, auth, shell tool gating, path validation | Explored |
+
+**Note**: Upstream removed the legacy `paper_trading/` package in favor of new `agent/src/trading/` and `agent/src/live/` architecture. Direct merge would conflict with our custom paper trading system.
