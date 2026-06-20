@@ -63,3 +63,21 @@ NOTES.md
 
 # Agent tool aliases (auto-generated mirror of CLAUDE.md)
 AGENTS.md
+
+# Paper trading — state, logs, and equity curves (regenerate per run)
+agent/paper_runs/
+paper_runs/
+
+# Systemd / service files (local deployment config)
+vibe-trading.service
+
+# Local shell scripts (deployment-specific)
+run-vibe-trading.sh
+run_py.sh
+
+# Test files (local development only)
+test_orchestrator.py
+test_paper_trading.py
+
+# Backtest run artifacts (large, regenerate from configs)
+agent/backtest_runs/

@@ -1,0 +1,7 @@
+# Core dependencies for paper trading module
+requests>=2.31.0
+pandas>=2.0.0
+numpy>=1.24.0
+ccxt>=4.0.0
+web3>=6.0.0
+python-dotenv>=1.0.0

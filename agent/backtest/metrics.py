@@ -16,13 +16,13 @@ from backtest.models import TradeRecord
 
 _TRADING_DAYS = {"tushare": 252, "yfinance": 252, "okx": 365, "akshare": 252, "ccxt": 365}
 _BARS_PER_DAY = {
-    "1m":  {"tushare": 240, "okx": 1440, "yfinance": 390, "akshare": 240, "ccxt": 1440},
-    "5m":  {"tushare": 48,  "okx": 288,  "yfinance": 78,  "akshare": 48,  "ccxt": 288},
-    "15m": {"tushare": 16,  "okx": 96,   "yfinance": 26,  "akshare": 16,  "ccxt": 96},
-    "30m": {"tushare": 8,   "okx": 48,   "yfinance": 13,  "akshare": 8,   "ccxt": 48},
-    "1H":  {"tushare": 4,   "okx": 24,   "yfinance": 7,   "akshare": 4,   "ccxt": 24},
-    "4H":  {"tushare": 1,   "okx": 6,    "yfinance": 2,   "akshare": 1,   "ccxt": 6},
-    "1D":  {"tushare": 1,   "okx": 1,    "yfinance": 1,   "akshare": 1,   "ccxt": 1},
+    "1m": {"tushare": 240, "okx": 1440, "yfinance": 390, "akshare": 240, "ccxt": 1440},
+    "5m": {"tushare": 48, "okx": 288, "yfinance": 78, "akshare": 48, "ccxt": 288},
+    "15m": {"tushare": 16, "okx": 96, "yfinance": 26, "akshare": 16, "ccxt": 96},
+    "30m": {"tushare": 8, "okx": 48, "yfinance": 13, "akshare": 8, "ccxt": 48},
+    "1H": {"tushare": 4, "okx": 24, "yfinance": 7, "akshare": 4, "ccxt": 24},
+    "4H": {"tushare": 1, "okx": 6, "yfinance": 2, "akshare": 1, "ccxt": 6},
+    "1D": {"tushare": 1, "okx": 1, "yfinance": 1, "akshare": 1, "ccxt": 1},
 }
 
 
@@ -180,7 +180,10 @@ def calc_metrics(
     port_ret = equity_curve.pct_change().fillna(0.0)
 
     total_ret = float(equity_curve.iloc[-1] / initial_cash - 1)
-    ann_ret = float((1 + total_ret) ** (bpy / max(n, 1)) - 1)
+    if total_ret > -1:
+        ann_ret = float((1 + total_ret) ** (bpy / max(n, 1)) - 1)
+    else:
+        ann_ret = -1.0
     vol = float(port_ret.std())
     sharpe = float(port_ret.mean() / (vol + 1e-10) * np.sqrt(bpy))
 
@@ -233,9 +236,19 @@ def _empty_metrics(initial_cash: float) -> Dict[str, Any]:
     """Return zero-valued metrics when no data is available."""
     return {
         "final_value": initial_cash,
-        "total_return": 0, "annual_return": 0, "max_drawdown": 0,
-        "sharpe": 0, "calmar": 0, "sortino": 0,
-        "win_rate": 0, "profit_loss_ratio": 0, "profit_factor": 0,
-        "max_consecutive_loss": 0, "avg_holding_days": 0, "trade_count": 0,
-        "benchmark_return": 0, "excess_return": 0, "information_ratio": 0,
+        "total_return": 0,
+        "annual_return": 0,
+        "max_drawdown": 0,
+        "sharpe": 0,
+        "calmar": 0,
+        "sortino": 0,
+        "win_rate": 0,
+        "profit_loss_ratio": 0,
+        "profit_factor": 0,
+        "max_consecutive_loss": 0,
+        "avg_holding_days": 0,
+        "trade_count": 0,
+        "benchmark_return": 0,
+        "excess_return": 0,
+        "information_ratio": 0,
     }
