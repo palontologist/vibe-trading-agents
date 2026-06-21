@@ -1,15 +1,15 @@
-"""SNIPER — All-in on 1 position, compound to $100.
+"""SNIPER V3 — Momentum capture with velocity detection.
 
 Strategy: $10 -> $100 in 6 hours
 - Go ALL-IN on 1 high-conviction trade
-- 20x leverage on most volatile asset
-- Take profit at 5% move (100% return)
-- Cut loss at 2% (40% loss)
-- Compound winnings immediately
+- 20x leverage on highest volatility asset
+- Capture momentum peaks (1-3% moves)
+- Compound immediately after each win
+- Rotate to next asset after each trade
 - Max 3 losses before pause
 
-Key insight: With $10, diversification kills you.
-You need concentration + conviction + speed.
+Key insight: Don't wait for perfect setup.
+Capture what the market gives you RIGHT NOW.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -33,45 +33,83 @@ INITIAL_CASH = float(os.environ.get("INITIAL_CASH", "10"))
 TARGET = 100.0
 LEVERAGE = 20
 POSITION_PCT = 0.95  # 95% per trade (almost all-in)
-TAKE_PROFIT = 0.05  # 5% = 100% with leverage (backup)
 STOP_LOSS = 0.02  # 2% = 40% with leverage
-MAX_HOLD = 1800  # 30 min max hold (faster rotation)
-TICK_INTERVAL = 3  # seconds (faster detection)
+MAX_HOLD = 600  # 10 min max hold (fast rotation)
+TICK_INTERVAL = 2  # seconds (fast detection)
 
-# MOMENTUM EXIT - the key innovation
-PEAK_DROP_EXIT = 0.40  # Close when PnL drops 40% from peak
-MIN_PROFIT_EXIT = 0.005  # Close if profit > 0.5% after 5 min (take what we can)
-VELOCITY_EXIT = 3  # Close if no new high in 3 ticks (9 seconds)
+# MOMENTUM EXIT - capture peaks
+PEAK_DROP_EXIT = 0.35  # Close when PnL drops 35% from peak
+MIN_PROFIT_EXIT = 0.003  # Close if profit > 0.3% after 3 min
+STALE_EXIT_TIMEOUT = 60  # Close if no new high in 60 seconds
 
-# Assets ranked by volatility
-ASSETS = ["JUP", "WIF", "SOL", "RENDER", "DOGE", "TURBO"]
+# ENTRY FILTERS - only trade when conditions are right
+MIN_VELOCITY = 0.0001  # Minimum 0.01% price movement (lower to trade in flat markets)
+MIN_VOLATILITY = 0.0001  # Minimum 0.01% volatility (lower to trade in flat markets)
+MAX_SPREAD = 0.001  # Maximum 0.1% spread
+
+# Assets ranked by volatility (highest first) - JUP is 5x more volatile than WIF
+ASSETS = ["JUP", "TURBO", "WIF", "SOL", "DOGE", "RENDER"]
 
 RUN_DIR = Path("./paper_runs/sniper")
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class SniperFetcher:
-    """Fast data fetching."""
+    """Fast data fetching with velocity tracking."""
 
     HL_URL = "https://api.hyperliquid.xyz/info"
 
-    def get_price(self, symbol: str) -> Optional[float]:
-        try:
-            resp = requests.post(self.HL_URL, json={"type": "allMids"}, timeout=5)
-            data = resp.json()
-            return float(data.get(symbol, 0))
-        except Exception:
-            return None
+    def __init__(self):
+        self._price_history: Dict[str, List[float]] = {}
+        self._last_fetch: Dict[str, float] = {}
 
     def get_prices(self, symbols: list) -> Dict[str, float]:
         try:
             resp = requests.post(self.HL_URL, json={"type": "allMids"}, timeout=5)
             data = resp.json()
-            return {s: float(data[s]) for s in symbols if s in data}
+            prices = {s: float(data[s]) for s in symbols if s in data}
+            
+            # Update price history
+            now = time.time()
+            for sym, price in prices.items():
+                if sym not in self._price_history:
+                    self._price_history[sym] = []
+                self._price_history[sym].append(price)
+                # Keep last 30 prices (60 seconds at 2s ticks)
+                if len(self._price_history[sym]) > 30:
+                    self._price_history[sym] = self._price_history[sym][-30:]
+                self._last_fetch[sym] = now
+            
+            return prices
         except Exception:
             return {}
 
-    def get_candles(self, symbol: str, interval: str = "5m", limit: int = 50) -> Optional[Dict]:
+    def get_velocity(self, symbol: str) -> float:
+        """Calculate price velocity (rate of change)."""
+        history = self._price_history.get(symbol, [])
+        if len(history) < 5:
+            return 0.0
+        
+        # Calculate velocity over last 5 ticks (10 seconds)
+        recent = history[-5:]
+        if len(recent) < 2:
+            return 0.0
+        
+        # Velocity = (current - oldest) / oldest
+        velocity = (recent[-1] - recent[0]) / recent[0]
+        return velocity
+
+    def get_volatility(self, symbol: str) -> float:
+        """Calculate recent volatility."""
+        history = self._price_history.get(symbol, [])
+        if len(history) < 10:
+            return 0.0
+        
+        # Calculate volatility over last 10 ticks (20 seconds)
+        returns = np.diff(history[-10:]) / history[-10:-1]
+        return float(np.std(returns)) if len(returns) > 0 else 0.0
+
+    def get_candles(self, symbol: str, interval: str = "5m", limit: int = 20) -> Optional[Dict]:
         try:
             end_time = int(time.time() * 1000)
             interval_ms = {"1m": 60000, "5m": 300000}
@@ -102,13 +140,13 @@ class SniperFetcher:
 
 
 class SniperSignal:
-    """High-conviction signal generation."""
+    """High-conviction signal generation with velocity."""
 
     def __init__(self):
         self.fg = 50
 
     def find_best_setup(self, prices: Dict[str, float], fetcher: SniperFetcher) -> Optional[Dict]:
-        """Find the single best trade setup."""
+        """Find the single best trade setup with velocity."""
         best = None
         best_score = 0
 
@@ -117,30 +155,43 @@ class SniperSignal:
             if not price:
                 continue
 
-            candles = fetcher.get_candles(symbol, "5m", 50)
-            if not candles or len(candles["close"]) < 30:
+            # Check velocity - must be moving
+            velocity = fetcher.get_velocity(symbol)
+            volatility = fetcher.get_volatility(symbol)
+            
+            # Skip if no momentum
+            if abs(velocity) < MIN_VELOCITY:
+                continue
+            
+            # Skip if low volatility
+            if volatility < MIN_VOLATILITY:
                 continue
 
-            score, reasons, confidence = self._analyze(symbol, price, candles)
+            candles = fetcher.get_candles(symbol, "5m", 20)
+            if not candles or len(candles["close"]) < 15:
+                continue
 
-            if score > best_score and confidence >= 60:
+            score, reasons, confidence = self._analyze(symbol, price, candles, velocity, volatility)
+
+            if score > best_score and confidence >= 50:
                 best_score = score
                 best = {
                     "symbol": symbol,
-                    "action": "LONG" if score > 0 else "SHORT",
+                    "action": "LONG" if velocity > 0 else "SHORT",
                     "score": score,
                     "confidence": confidence,
                     "reasons": reasons,
                     "price": price,
+                    "velocity": velocity,
+                    "volatility": volatility,
                 }
 
         return best
 
-    def _analyze(self, symbol: str, price: float, candles: Dict) -> tuple:
+    def _analyze(self, symbol: str, price: float, candles: Dict, velocity: float, volatility: float) -> tuple:
         closes = np.array(candles["close"])
         highs = np.array(candles["high"])
         lows = np.array(candles["low"])
-        volumes = np.array(candles["volume"])
 
         score = 0.0
         reasons = []
@@ -150,74 +201,56 @@ class SniperSignal:
         deltas = np.diff(closes[-15:])
         gains = np.where(deltas > 0, deltas, 0)
         losses = np.where(deltas < 0, -deltas, 0)
-        avg_gain = np.mean(gains)
+        avg_gain = np.mean(gains) if len(gains) > 0 else 0
         avg_loss = np.mean(losses) if np.mean(losses) > 0 else 1
         rsi = 100 - (100 / (1 + avg_gain / avg_loss))
 
         # MAs
         ma5 = np.mean(closes[-5:])
         ma10 = np.mean(closes[-10:])
-        ma20 = np.mean(closes[-20:])
 
-        # Position
-        pct_from_high = (max(highs[-20:]) - price) / max(highs[-20:]) * 100
-        pct_from_low = (price - min(lows[-20:])) / min(lows[-20:]) * 100
-
-        # Volume
-        avg_vol = np.mean(volumes[-20:])
-        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1
-
-        # ── LONG SETUP ──
-        # Oversold bounce
-        if rsi < 35:
-            score += 0.35
-            confidence += 20
-            reasons.append(f"RSI={rsi:.0f} oversold")
-
-        # Near support
-        if pct_from_low < 3 and pct_from_low > 0:
-            score += 0.25
+        # ── LONG SETUP (velocity > 0) ──
+        if velocity > 0:
+            score += 0.3
             confidence += 15
-            reasons.append(f"Near support ({pct_from_low:.1f}% from low)")
-
-        # MA alignment
-        if ma5 > ma10:
-            score += 0.15
-            confidence += 10
-            reasons.append("MA5>MA10")
-
-        # Volume surge
-        if vol_ratio > 2.0:
+            reasons.append(f"Velocity {velocity*100:.3f}%")
+            
+            if rsi < 40:
+                score += 0.2
+                confidence += 10
+                reasons.append(f"RSI={rsi:.0f} oversold")
+            
+            if ma5 > ma10:
+                score += 0.15
+                confidence += 10
+                reasons.append("MA5>MA10")
+            
+            if volatility > 0.001:
+                score += 0.15
+                confidence += 10
+                reasons.append(f"Vol={volatility*100:.3f}%")
+        
+        # ── SHORT SETUP (velocity < 0) ──
+        else:
+            score -= 0.3
             confidence += 15
-            reasons.append(f"Volume {vol_ratio:.1f}x")
+            reasons.append(f"Velocity {velocity*100:.3f}%")
+            
+            if rsi > 60:
+                score -= 0.2
+                confidence += 10
+                reasons.append(f"RSI={rsi:.0f} overbought")
+            
+            if ma5 < ma10:
+                score -= 0.15
+                confidence += 10
+                reasons.append("MA5<MA10")
 
-        # F&G
-        if self.fg < 30:
-            score += 0.15
-            confidence += 8
-            reasons.append(f"F&G={self.fg}")
-
-        # ── SHORT SETUP ──
-        if rsi > 65:
-            score -= 0.35
-            confidence += 20
-            reasons.append(f"RSI={rsi:.0f} overbought")
-
-        if pct_from_high < 3 and pct_from_high > 0:
-            score -= 0.25
-            confidence += 15
-            reasons.append(f"Near resistance ({pct_from_high:.1f}% from high)")
-
-        if ma5 < ma10:
-            score -= 0.15
-            confidence += 10
-            reasons.append("MA5<MA10")
-
-        return score, reasons, min(95, confidence)
+        return score, reasons, min(90, confidence)
 
 
 class SniperPortfolio:
-    """All-in portfolio management."""
+    """All-in portfolio management with velocity tracking."""
 
     def __init__(self, initial_cash: float = 10.0):
         self.cash = initial_cash
@@ -228,6 +261,7 @@ class SniperPortfolio:
         self.losses = 0
         self.total_pnl = 0.0
         self.consecutive_losses = 0
+        self.trade_history: List[Dict] = []
         self._load_state()
 
     def _state_path(self):
@@ -245,6 +279,7 @@ class SniperPortfolio:
                 self.losses = d.get("losses", 0)
                 self.total_pnl = d.get("total_pnl", 0.0)
                 self.consecutive_losses = d.get("consecutive_losses", 0)
+                self.trade_history = d.get("trade_history", [])
             except Exception:
                 pass
 
@@ -260,6 +295,7 @@ class SniperPortfolio:
             "consecutive_losses": self.consecutive_losses,
             "win_rate": self.wins / max(1, self.total_trades),
             "target_reached": self.cash >= TARGET,
+            "trade_history": self.trade_history[-20:],  # Keep last 20 trades
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._state_path().write_text(json.dumps(state, indent=2))
@@ -283,7 +319,7 @@ class SniperPortfolio:
             return False
         return True
 
-    def open_position(self, symbol: str, side: str, price: float, confidence: int) -> bool:
+    def open_position(self, symbol: str, side: str, price: float, confidence: int, velocity: float) -> bool:
         if not self.can_trade():
             return False
 
@@ -307,17 +343,17 @@ class SniperPortfolio:
             "entry_time": time.time(),
             "highest_price": price,
             "lowest_price": price,
-            "peak_pnl_pct": 0.0,  # Track peak profit
-            "peak_time": time.time(),  # When we hit peak
-            "last_high_tick": 0,  # Tick count of last new high
+            "peak_pnl_pct": 0.0,
+            "peak_time": time.time(),
+            "last_high_time": time.time(),
+            "entry_velocity": velocity,
         }
         self.cash -= (margin + fee)
         self.total_trades += 1
         self._save_state()
 
-        ret_potential = TAKE_PROFIT * LEVERAGE * 100
         logger.info(f"SNIPER OPEN {side} {symbol}: ${notional:.2f} @ ${price:.6f} ({LEVERAGE}x)")
-        logger.info(f"  TP: {TAKE_PROFIT*100}% = {ret_potential:.0f}% return | SL: {STOP_LOSS*100}%")
+        logger.info(f"  Velocity: {velocity*100:.3f}% | Confidence: {confidence}%")
         return True
 
     def close_position(self, price: float, reason: str) -> Optional[float]:
@@ -346,6 +382,23 @@ class SniperPortfolio:
             self.consecutive_losses += 1
 
         pnl_pct = net_pnl / pos["margin"] * 100
+        age = time.time() - pos["entry_time"]
+        
+        # Record trade
+        trade = {
+            "symbol": pos["symbol"],
+            "side": pos["side"],
+            "entry": entry,
+            "exit": price,
+            "pnl": net_pnl,
+            "pnl_pct": pnl_pct,
+            "age_s": age,
+            "reason": reason,
+            "peak_pnl_pct": pos["peak_pnl_pct"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self.trade_history.append(trade)
+
         logger.info(f"SNIPER CLOSE {pos['symbol']}: PnL=${net_pnl:+.4f} ({pnl_pct:+.1f}% of margin) [{reason}]")
         logger.info(f"  Cash: ${self.cash:.4f} | Target: ${TARGET:.0f} | Progress: {self.cash/TARGET*100:.1f}%")
 
@@ -353,58 +406,54 @@ class SniperPortfolio:
         self._save_state()
         return net_pnl
 
-    def check_exit(self, prices: Dict[str, float], tick_count: int = 0) -> Optional[tuple]:
+    def check_exit(self, prices: Dict[str, float]) -> Optional[Tuple[float, str]]:
         if not self.position:
             return None
 
         pos = self.position
         cur = prices.get(pos["symbol"], pos["entry_price"])
         entry = pos["entry_price"]
-        age = time.time() - pos["entry_time"]
+        now = time.time()
+        age = now - pos["entry_time"]
 
         # Update trailing
         if pos["side"] == "LONG":
             pos["highest_price"] = max(pos["highest_price"], cur)
             pnl_pct = (cur - entry) / entry
-            trail_drop = (pos["highest_price"] - cur) / pos["highest_price"]
         else:
             pos["lowest_price"] = min(pos["lowest_price"], cur)
             pnl_pct = (entry - cur) / entry
-            trail_drop = (cur - pos["lowest_price"]) / pos["lowest_price"]
 
         # Update peak PnL tracking
         if pnl_pct > pos["peak_pnl_pct"]:
             pos["peak_pnl_pct"] = pnl_pct
-            pos["peak_time"] = time.time()
-            pos["last_high_tick"] = tick_count
+            pos["peak_time"] = now
+            pos["last_high_time"] = now
 
-        # ── MOMENTUM EXIT LOGIC ──
+        # ── EXIT LOGIC ──
         
-        # 1. HARD STOP LOSS - always exit
+        # 1. HARD STOP LOSS
         if pnl_pct <= -STOP_LOSS:
             return (cur, f"STOP LOSS ({pnl_pct*100:.2f}%)")
         
-        # 2. TAKE PROFIT - if we hit 5%, take it
-        if pnl_pct >= TAKE_PROFIT:
-            return (cur, f"TAKE PROFIT ({pnl_pct*100:.2f}%)")
-        
-        # 3. MOMENTUM PEAK EXIT - close when profit drops from peak
-        if pos["peak_pnl_pct"] > 0.005:  # Only if we had >0.5% profit
+        # 2. MOMENTUM PEAK EXIT - close when profit drops from peak
+        if pos["peak_pnl_pct"] > 0.003:
             drop_from_peak = pos["peak_pnl_pct"] - pnl_pct
             drop_pct = drop_from_peak / pos["peak_pnl_pct"]
             
             if drop_pct >= PEAK_DROP_EXIT:
                 return (cur, f"PEAK EXIT (peak={pos['peak_pnl_pct']*100:.2f}% now={pnl_pct*100:.2f}% drop={drop_pct*100:.0f}%)")
         
-        # 4. TAKE WHAT WE CAN - if profitable after 5 min, close
-        if age >= 300 and pnl_pct > MIN_PROFIT_EXIT:
+        # 3. TAKE WHAT WE CAN - if profitable after 3 min, close
+        if age >= 180 and pnl_pct > MIN_PROFIT_EXIT:
             return (cur, f"TAKE PROFIT ({pnl_pct*100:.2f}% after {age/60:.1f}min)")
         
-        # 5. STALE POSITION - no new high in 9 seconds and flat
-        if age >= 30 and pnl_pct < 0.002 and (tick_count - pos["last_high_tick"]) >= VELOCITY_EXIT:
-            return (cur, f"STALE EXIT (no momentum, pnl={pnl_pct*100:.2f}%)")
+        # 4. STALE POSITION - no new high in 90 seconds
+        time_since_high = now - pos["last_high_time"]
+        if time_since_high >= STALE_EXIT_TIMEOUT and pnl_pct < 0.001:
+            return (cur, f"STALE EXIT (no momentum for {time_since_high:.0f}s)")
         
-        # 6. MAX HOLD - force close
+        # 5. MAX HOLD - force close
         if age >= MAX_HOLD:
             return (cur, f"MAX HOLD ({age/60:.0f}min)")
 
@@ -425,13 +474,14 @@ class SniperOrchestrator:
 
     def run(self):
         logger.info("=" * 60)
-        logger.info("SNIPER V2 — MOMENTUM PEAK STRATEGY")
+        logger.info("SNIPER V3 — MOMENTUM CAPTURE")
         logger.info(f"Capital: ${INITIAL_CASH} -> Target: ${TARGET}")
-        logger.info(f"Leverage: {LEVERAGE}x | TP: {TAKE_PROFIT*100}% | SL: {STOP_LOSS*100}%")
-        logger.info(f"Momentum Exit: Close when profit drops {PEAK_DROP_EXIT*100:.0f}% from peak")
-        logger.info(f"Take What We Can: Close if profitable after 5 min")
-        logger.info(f"Stale Exit: Close if no new high in {VELOCITY_EXIT*3}s")
-        logger.info(f"Max Hold: {MAX_HOLD/60:.0f} min (faster rotation)")
+        logger.info(f"Leverage: {LEVERAGE}x | SL: {STOP_LOSS*100}%")
+        logger.info(f"Peak Drop Exit: {PEAK_DROP_EXIT*100:.0f}% from peak")
+        logger.info(f"Take What We Can: Close if >{MIN_PROFIT_EXIT*100:.1f}% after 3min")
+        logger.info(f"Stale Exit: {STALE_EXIT_TIMEOUT}s timeout")
+        logger.info(f"Max Hold: {MAX_HOLD/60:.0f} min")
+        logger.info(f"Assets: {', '.join(ASSETS)}")
         logger.info("=" * 60)
 
         while self._running:
@@ -460,8 +510,8 @@ class SniperOrchestrator:
         if not prices:
             return
 
-        # Check exit first (with momentum detection)
-        exit_signal = self.portfolio.check_exit(prices, self._tick_count)
+        # Check exit first
+        exit_signal = self.portfolio.check_exit(prices)
         if exit_signal:
             price, reason = exit_signal
             self.portfolio.close_position(price, reason)
@@ -469,8 +519,11 @@ class SniperOrchestrator:
         # Find new setup if no position
         if self.portfolio.can_trade():
             setup = self.signal.find_best_setup(prices, self.fetcher)
-            if setup and setup["confidence"] >= 60:
-                self.portfolio.open_position(setup["symbol"], setup["action"], setup["price"], setup["confidence"])
+            if setup and setup["confidence"] >= 50:
+                self.portfolio.open_position(
+                    setup["symbol"], setup["action"], setup["price"],
+                    setup["confidence"], setup["velocity"]
+                )
 
         # Log
         equity = self.portfolio._calc_equity(prices)
@@ -499,6 +552,7 @@ class SniperOrchestrator:
                 "current": cur,
                 "pnl": pnl,
                 "age_s": time.time() - pos["entry_time"],
+                "peak_pnl_pct": pos["peak_pnl_pct"],
             }
 
         entry = {
@@ -528,6 +582,10 @@ class SniperOrchestrator:
             cur = prices.get(pos["symbol"], pos["entry_price"])
             pnl = (cur - pos["entry_price"]) / pos["entry_price"] * 100
             logger.info(f"  POSITION: {pos['side']} {pos['symbol']} @ ${pos['entry_price']:.6f} → ${cur:.6f} ({pnl:+.3f}%)")
+            
+            # Show velocity
+            velocity = self.fetcher.get_velocity(pos["symbol"])
+            logger.info(f"  Velocity: {velocity*100:.3f}% | Peak: {pos['peak_pnl_pct']*100:.2f}%")
 
 
 def main():
