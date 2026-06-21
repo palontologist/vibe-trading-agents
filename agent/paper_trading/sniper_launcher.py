@@ -35,10 +35,10 @@ INITIAL_CASH = float(os.environ.get("INITIAL_CASH", "10"))
 TARGET = 100.0
 LEVERAGE = 20
 POSITION_PCT = 0.95
-STOP_LOSS = 0.02
-TAKE_PROFIT = 0.05
-PEAK_DROP_EXIT = 0.40
-MAX_HOLD = 1800
+STOP_LOSS = 0.05     # 5% price move = 100% loss (gives room)
+TAKE_PROFIT = 0.10   # 10% price move = 200% return (3 trades to $100)
+PEAK_DROP_EXIT = 0.50  # 50% drop from peak (let winners run)
+MAX_HOLD = 3600       # 1 hour (let big moves develop)
 TICK_INTERVAL = 3
 
 ASSETS = ["JUP", "TURBO", "WIF", "SOL", "DOGE", "RENDER"]
@@ -302,30 +302,30 @@ class Portfolio:
             pos["peak_pnl_pct"] = pnl_pct
             pos["last_high_time"] = now
 
-        # 1. STOP LOSS — prediction wrong
+        # 1. STOP LOSS — prediction wrong (5% price move = 100% loss)
         if pnl_pct <= -STOP_LOSS:
             return (cur, f"STOP_LOSS ({pnl_pct*100:.2f}%)")
 
-        # 2. PEAK CAPTURED — had profit, it faded
-        if pos["peak_pnl_pct"] > 0.003:
+        # 2. PEAK CAPTURED — had big profit, it faded 50%
+        if pos["peak_pnl_pct"] > 0.01:
             drop = pos["peak_pnl_pct"] - pnl_pct
             drop_pct = drop / pos["peak_pnl_pct"]
             if drop_pct >= PEAK_DROP_EXIT:
-                return (cur, f"PEAK_CAPTURED (peak={pos['peak_pnl_pct']*100:.2f}% drop={drop_pct*100:.0f}%)")
+                return (cur, f"PEAK (peak={pos['peak_pnl_pct']*100:.1f}% drop={drop_pct*100:.0f}%)")
 
-        # 3. TAKE PROFIT — prediction very correct
+        # 3. TAKE PROFIT — prediction correct (10% move = 200% return)
         if pnl_pct >= TAKE_PROFIT:
-            return (cur, f"TAKE_PROFIT ({pnl_pct*100:.2f}%)")
+            return (cur, f"TAKE_PROFIT ({pnl_pct*100:.1f}%)")
 
-        # 4. TIME EXIT — only if clearly wrong direction
+        # 4. TIME EXIT — only if clearly wrong direction after 1 hour
         if age >= MAX_HOLD:
             vel = fetcher.velocity(pos["symbol"])
-            if pos["side"] == "LONG" and vel < -0.001:
-                return (cur, f"TIME_WRONG_DIR (vel={vel*100:.3f}%)")
-            if pos["side"] == "SHORT" and vel > 0.001:
-                return (cur, f"TIME_WRONG_DIR (vel={vel*100:.3f}%)")
-            if pnl_pct > 0:
-                return (cur, f"TIME_PROFIT ({pnl_pct*100:.2f}%)")
+            if pos["side"] == "LONG" and vel < -0.002:
+                return (cur, f"TIME_WRONG (vel={vel*100:.2f}%)")
+            if pos["side"] == "SHORT" and vel > 0.002:
+                return (cur, f"TIME_WRONG (vel={vel*100:.2f}%)")
+            if pnl_pct > 0.02:
+                return (cur, f"TIME_UP ({pnl_pct*100:.1f}%)")
 
         return None
 
@@ -343,11 +343,13 @@ class Orchestrator:
     def run(self):
         elapsed = (time.time() - self.start_time) / 3600
         logger.info("=" * 60)
-        logger.info("SNIPER V5 — 6-HOUR COMPOUND")
+        logger.info("SNIPER V5 — BIG MOVES (3 trades to $100)")
         logger.info(f"${INITIAL_CASH} -> ${TARGET} in 6h")
-        logger.info(f"Leverage: {LEVERAGE}x | SL: {STOP_LOSS*100}% | TP: {TAKE_PROFIT*100}%")
+        logger.info(f"Leverage: {LEVERAGE}x")
+        logger.info(f"SL: {STOP_LOSS*100:.0f}% (100% loss) | TP: {TAKE_PROFIT*100:.0f}% (200% return)")
         logger.info(f"Peak drop exit: {PEAK_DROP_EXIT*100:.0f}%")
-        logger.info(f"NO stale exit — hold through flat")
+        logger.info(f"Max hold: {MAX_HOLD/60:.0f} min")
+        logger.info(f"NO stale exit — let winners run")
         logger.info(f"Assets: {', '.join(ASSETS)}")
         logger.info("=" * 60)
 
