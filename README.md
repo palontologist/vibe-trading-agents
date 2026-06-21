@@ -62,6 +62,7 @@ MarketAnalyst → SignalGenerator → RiskAssessor → TradeExecutor → Portfol
 | `realtime_orchestrator.py` | Continuous autonomous trading loop (crypto + commodities) |
 | `forex_paper_launcher.py` | Multi-exchange paper trader (Binance + Hyperliquid) |
 | `aggressive_forex_launcher.py` | High-frequency forex scalper with Frankfurter ECB API |
+| `sniper_launcher.py` | V13 momentum sniper — W token with trailing stops (70% WR) |
 | `paper_engine.py` | Paper trade execution engine with slippage/fee simulation |
 | `risk_manager.py` | Position limits, daily loss limits, leverage caps |
 | `wallet_connector.py` | Read-only Base wallet reader (ETH, USDC, WETH) |
@@ -148,6 +149,19 @@ Strongest signal: XAU LONG (87% confidence, RSI oversold).
 USD/MXN LONG @ 17.3369 — $60 notional (60% of equity), 10x leverage.
 7 volatile exotic pairs monitored with simulated intraday moves from ECB base rates.
 
+### Sniper V13 — Momentum Scalper (June 21, Live)
+
+| Metric | Value |
+|--------|-------|
+| Total PnL | +$0.178 (+1.8%) |
+| Trades | 10 |
+| Win Rate | 70% (7/10) |
+| R:R | 0.94:1 |
+| EV | +$0.020/trade |
+| Best Trade | +$0.114 (23.9%) |
+
+**Strategy**: Catch W token momentum (0.25%+ moves in 5 min), trailing stops at 0.35% peak, 95% position sizing with 20x leverage.
+
 ---
 
 ## Growth Framework: $10 → $10,000 in 10 Days
@@ -194,6 +208,44 @@ python -m paper_trading.growth.launcher    # Run live paper
 | **Hyperliquid API** | PAXG, SPX, crypto perps | Real-time tick prices |
 | **CCXT / Binance** | XAU, XAG, NATGAS | OHLCV candles |
 | **Frankfurter API (ECB)** | USD/MXN, BRL, ZAR, NZD, HUF, MYR, PLN | Daily ECB rates + simulated intraday volatility |
+| **Polymarket API** | Prediction markets (politics, crypto, events) | Binary outcome trading |
+
+---
+
+## Supported Markets
+
+### Crypto Perpetual Futures (Hyperliquid)
+- **880+ assets** including meme coins (POPCAT, W, JUP), major L1s (SOL, ETH, BTC)
+- Up to **50x leverage**, 24/7 trading
+- Best for momentum scalping and trend following
+- See [docs/MARKETS.md](docs/MARKETS.md) for volatility data and asset rankings
+
+### Polymarket Prediction Markets
+- **Binary outcome** markets (Yes/No) on real-world events
+- Categories: Politics, Crypto prices, Sports, Entertainment
+- Prices represent probability ($0.65 = 65% chance)
+- USDC settlement on Polygon blockchain
+- Resolution-based profit: $1.00 if correct, $0.00 if wrong
+
+### Forex (Currency Pairs)
+- **Major pairs**: EUR/USD, GBP/USD, USD/JPY
+- **Exotic pairs**: USD/MXN, USD/BRL, USD/ZAR (higher volatility)
+- 24/5 trading, pip-based pricing
+- Frankfurter ECB API for exchange rates
+
+### Commodities
+- **Energy**: Crude Oil (CL), Natural Gas (NG)
+- **Metals**: Gold (GC), Silver (SI), Platinum (PL)
+- **Agricultural**: Corn, Wheat, Soybeans
+- Contract-based sizing, exchange hours
+
+### Stocks/Equities
+- NYSE, NASDAQ listings
+- Fractional shares supported
+- ETFs (SPY, QQQ) and individual stocks
+- Standard market hours (9:30-16:00 ET)
+
+For detailed market analysis, volatility data, and trading configurations, see **[docs/MARKETS.md](docs/MARKETS.md)**.
 
 ---
 
@@ -233,6 +285,7 @@ Vibe-Trading/
 │   │   │   ├── orchestrator.py # Continuous trading loop
 │   │   │   ├── launcher.py     # Entry point
 │   │   │   └── backtest.py     # Historical validation
+│   │   ├── sniper_launcher.py      # V13 Momentum sniper (W token)
 │   │   ├── multi_agent.py          # 5-agent orchestration framework
 │   │   ├── realtime_orchestrator.py # Continuous autonomous trading loop
 │   │   ├── forex_paper_launcher.py  # Multi-exchange commodity trader
@@ -244,11 +297,14 @@ Vibe-Trading/
 │   │   └── agent_scorecard.py      # Performance scoring
 │   ├── paper_runs/             # Paper trade logs & equity curves
 │   │   ├── growth/             # Growth framework logs
+│   │   ├── sniper/             # Sniper V12/V13 logs
 │   │   ├── forex_commodity/    # Commodity paper runs
 │   │   └── aggressive_forex/   # Forex paper runs
 │   ├── backtest_runs/          # Backtest results
 │   ├── src/                    # Core trading source
 │   └── backtest/               # Backtest engine
+├── docs/
+│   └── MARKETS.md              # Supported markets documentation
 ├── frontend/                   # React Web UI
 ├── GROWTH_FRAMEWORK.md         # $10 → $10K documentation
 ├── paper_requirements.txt      # Paper trading dependencies

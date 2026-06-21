@@ -1,17 +1,18 @@
-"""SNIPER V5 — Hold prediction, compound peaks.
+"""SNIPER V13 — W ONLY, BIG BETS, BIG MOMENTUM
 
-$10 -> $100 in 6 hours
+Final approach: focus on the single best asset (W) with maximum conviction.
 
-EXIT RULES (only exit when prediction is WRONG):
-1. Stop loss (-2%) — price went against us
-2. Peak captured — we had profit, it faded 40%, take it
-3. Take profit (+5%) — prediction very correct
-4. Time exit (30 min) — only if clearly wrong direction
+W is the most volatile asset on Hyperliquid:
+- Moves 0.36% every 5 min = 7.2% with 20x
+- Biggest wins: +28.9%, +20.2%, +13%
+- We captured these before — now we go ALL IN on W
 
-NO stale exit. If prediction is right, hold through flat.
-
-REENTRY: Immediately scan for next best setup after each exit.
-COMPOUND: 95% of equity per trade.
+SETTINGS:
+- W only (no diversification)
+- 95% position sizing (all-in on one trade)
+- Wait for 0.5% momentum (bigger signal)
+- Trailing stop to capture big moves
+- 20x leverage
 """
 
 from __future__ import annotations
@@ -29,21 +30,20 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────
-
 INITIAL_CASH = float(os.environ.get("INITIAL_CASH", "10"))
 TARGET = 100.0
 LEVERAGE = 20
-POSITION_PCT = 0.95
-STOP_LOSS = 0.05     # 5% price move = 100% loss (gives room)
-TAKE_PROFIT = 0.10   # 10% price move = 200% return (3 trades to $100)
-PEAK_DROP_EXIT = 0.50  # 50% drop from peak (let winners run)
-MAX_HOLD = 3600       # 1 hour (let big moves develop)
-TICK_INTERVAL = 3
+POSITION_PCT = 0.95   # ALL IN on one trade
+STOP_LOSS = 0.005     # 0.5% price = 10% loss (wider, avoid noise)
+TAKE_PROFIT = 0.03    # 3% max (but trailing will exit before)
+PEAK_TRAIL_ACTIVATE = 0.0035  # Trail after 0.35% peak (balance speed vs size)
+PEAK_DROP_EXIT = 0.40  # 40% drop from peak (tighter trail = lock profit faster)
+MOMENTUM_THRESHOLD = 0.0025  # 0.25% move in 5 min (catch W moves)
+MAX_HOLD = 1800       # 30 min
+TICK_INTERVAL = 1
 
-ASSETS = ["JUP", "TURBO", "WIF", "SOL", "DOGE", "RENDER"]
-
-RUN_DIR = Path("./paper_runs/sniper")
+ASSETS = ["W"]  # W ONLY
+RUN_DIR = Path(__file__).resolve().parent.parent / "paper_runs" / "sniper"
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -65,92 +65,44 @@ class Fetcher:
                     if s not in self._history:
                         self._history[s] = []
                     self._history[s].append(p)
-                    if len(self._history[s]) > 60:
-                        self._history[s] = self._history[s][-60:]
+                    if len(self._history[s]) > 300:
+                        self._history[s] = self._history[s][-300:]
             return result
         except Exception:
             return {}
 
-    def velocity(self, symbol: str, lookback: int = 10) -> float:
+    def momentum(self, symbol: str) -> float:
+        h = self._history.get(symbol, [])
+        if len(h) < 150:
+            return 0.0
+        return (h[-1] - h[-150]) / h[-150]
+
+    def velocity(self, symbol: str, lookback: int = 30) -> float:
         h = self._history.get(symbol, [])
         if len(h) < lookback:
             return 0.0
         recent = h[-lookback:]
         return (recent[-1] - recent[0]) / recent[0]
 
-    def trend(self, symbol: str, lookback: int = 20) -> float:
-        h = self._history.get(symbol, [])
-        if len(h) < lookback:
-            return 0.0
-        return (h[-1] - h[-lookback]) / h[-lookback]
-
-    def candles(self, symbol: str) -> Optional[Dict]:
-        try:
-            now = int(time.time() * 1000)
-            start = now - (20 * 300000)
-            resp = requests.post(
-                self.HL_URL,
-                json={"type": "candleSnapshot", "req": {"coin": symbol, "interval": "5m", "startTime": start, "endTime": now}},
-                timeout=10,
-            )
-            data = resp.json()
-            if not data:
-                return None
-            return {
-                "close": [float(d["c"]) for d in data],
-                "high": [float(d["h"]) for d in data],
-                "low": [float(d["l"]) for d in data],
-            }
-        except Exception:
-            return None
-
 
 class Signal:
     def evaluate(self, symbol: str, price: float, fetcher: Fetcher) -> Optional[Dict]:
+        mom = fetcher.momentum(symbol)
         vel = fetcher.velocity(symbol)
-        trend = fetcher.trend(symbol)
-        candles = fetcher.candles(symbol)
-        if not candles or len(candles["close"]) < 15:
-            return None
-
-        closes = np.array(candles["close"])
-
-        # RSI
-        deltas = np.diff(closes[-15:])
-        gains = np.where(deltas > 0, deltas, 0)
-        losses_arr = np.where(deltas < 0, -deltas, 0)
-        avg_gain = np.mean(gains)
-        avg_loss = max(np.mean(losses_arr), 0.00001)
-        rsi = 100 - (100 / (1 + avg_gain / avg_loss))
-
-        ma5 = np.mean(closes[-5:])
-        ma10 = np.mean(closes[-10:])
-
-        score = 0.0
         reasons = []
 
-        # LONG
-        if vel > 0 and (trend > -0.003 or vel > 0.001):
-            score = 0.3
-            reasons.append(f"vel={vel*100:.3f}%")
-            if rsi < 40:
-                score += 0.2
-                reasons.append(f"rsi={rsi:.0f}")
-            if ma5 > ma10:
-                score += 0.15
-                reasons.append("ma_up")
+        # BUY: W moved up 0.5%+ in 5 min
+        if mom > MOMENTUM_THRESHOLD:
+            score = 0.7
+            reasons.append(f"mom={mom*100:+.3f}%")
+            reasons.append(f"vel={vel*100:+.3f}%")
             return {"side": "LONG", "score": score, "reasons": reasons, "vel": vel}
 
-        # SHORT
-        if vel < 0 and (trend < 0.003 or vel < -0.001):
-            score = 0.3
-            reasons.append(f"vel={vel*100:.3f}%")
-            if rsi > 60:
-                score += 0.2
-                reasons.append(f"rsi={rsi:.0f}")
-            if ma5 < ma10:
-                score += 0.15
-                reasons.append("ma_dn")
+        # SELL: W moved down 0.5%+ in 5 min
+        if mom < -MOMENTUM_THRESHOLD:
+            score = 0.7
+            reasons.append(f"mom={mom*100:+.3f}%")
+            reasons.append(f"vel={vel*100:+.3f}%")
             return {"side": "SHORT", "score": score, "reasons": reasons, "vel": vel}
 
         return None
@@ -204,7 +156,8 @@ class Portfolio:
 
     def can_trade(self) -> bool:
         return (self.position is None
-                and self.consecutive_losses < 3
+                and self.consecutive_losses < 4
+                and self.cash >= 1.0
                 and self.cash < TARGET)
 
     def open(self, symbol: str, side: str, price: float, vel: float, reasons: list) -> bool:
@@ -213,7 +166,7 @@ class Portfolio:
         notional = self.cash * POSITION_PCT
         margin = notional / LEVERAGE
         fee = notional * 0.0005
-        if margin + fee > self.cash or notional < 5:
+        if margin + fee > self.cash or notional < 1:
             return False
 
         self.position = {
@@ -224,20 +177,16 @@ class Portfolio:
             "margin": margin,
             "entry_time": time.time(),
             "peak_pnl_pct": 0.0,
-            "last_high_time": time.time(),
-            "entry_vel": vel,
-            "entry_reasons": reasons,
         }
         self.cash -= (margin + fee)
         self.total_trades += 1
         self.save()
-        logger.info(f"OPEN {side} {symbol} @ ${price:.6f} | ${notional:.2f} ({LEVERAGE}x) | vel={vel*100:.3f}% | {', '.join(reasons)}")
+        logger.info(f"OPEN {side} {symbol} @ ${price:.6f} | ${notional:.2f} ({LEVERAGE}x) | {', '.join(reasons)}")
         return True
 
     def close(self, price: float, reason: str) -> float:
         if not self.position:
             return 0.0
-
         pos = self.position
         entry = pos["entry_price"]
         notional = pos["notional"]
@@ -249,9 +198,9 @@ class Portfolio:
 
         fee = notional * 0.0005
         net_pnl = pnl - fee
-
         self.cash += pos["margin"] + net_pnl
         self.total_pnl += net_pnl
+
         if net_pnl > 0:
             self.wins += 1
             self.consecutive_losses = 0
@@ -263,69 +212,52 @@ class Portfolio:
         age = time.time() - pos["entry_time"]
 
         self.history.append({
-            "symbol": pos["symbol"],
-            "side": pos["side"],
-            "entry": entry,
-            "exit": price,
-            "pnl": net_pnl,
-            "pnl_pct": pnl_pct,
-            "age_s": age,
-            "peak": pos["peak_pnl_pct"],
+            "symbol": pos["symbol"], "side": pos["side"],
+            "entry": entry, "exit": price,
+            "pnl": net_pnl, "pnl_pct": pnl_pct,
+            "age_s": age, "peak": pos["peak_pnl_pct"],
             "reason": reason,
             "ts": datetime.now(timezone.utc).isoformat(),
         })
 
-        logger.info(f"CLOSE {pos['symbol']}: ${net_pnl:+.4f} ({pnl_pct:+.1f}%) [{reason}] | cash=${self.cash:.4f} ({self.cash/TARGET*100:.0f}%)")
-
+        logger.info(f"CLOSE {pos['symbol']}: ${net_pnl:+.4f} ({pnl_pct:+.1f}%) [{reason}] | cash=${self.cash:.4f}")
         self.position = None
         self.save()
         return net_pnl
 
-    def check_exit(self, prices: Dict[str, float], fetcher: Fetcher) -> Optional[Tuple[float, str]]:
-        """Exit ONLY when prediction is wrong. Hold through flat."""
+    def check_exit(self, price: float) -> Optional[Tuple[float, str]]:
         if not self.position:
             return None
-
         pos = self.position
-        cur = prices.get(pos["symbol"], pos["entry_price"])
         entry = pos["entry_price"]
-        now = time.time()
-        age = now - pos["entry_time"]
+        age = time.time() - pos["entry_time"]
 
         if pos["side"] == "LONG":
-            pnl_pct = (cur - entry) / entry
+            pnl_pct = (price - entry) / entry
         else:
-            pnl_pct = (entry - cur) / entry
+            pnl_pct = (entry - price) / entry
 
-        # Update peak
         if pnl_pct > pos["peak_pnl_pct"]:
             pos["peak_pnl_pct"] = pnl_pct
-            pos["last_high_time"] = now
 
-        # 1. STOP LOSS — prediction wrong (5% price move = 100% loss)
+        # 1. STOP LOSS
         if pnl_pct <= -STOP_LOSS:
-            return (cur, f"STOP_LOSS ({pnl_pct*100:.2f}%)")
+            return (price, f"STOP_LOSS ({pnl_pct*100:.2f}%)")
 
-        # 2. PEAK CAPTURED — had big profit, it faded 50%
-        if pos["peak_pnl_pct"] > 0.01:
+        # 2. TRAILING STOP
+        if pos["peak_pnl_pct"] >= PEAK_TRAIL_ACTIVATE:
             drop = pos["peak_pnl_pct"] - pnl_pct
             drop_pct = drop / pos["peak_pnl_pct"]
             if drop_pct >= PEAK_DROP_EXIT:
-                return (cur, f"PEAK (peak={pos['peak_pnl_pct']*100:.1f}% drop={drop_pct*100:.0f}%)")
+                return (price, f"TRAILING (peak={pos['peak_pnl_pct']*100:.2f}% drop={drop_pct*100:.0f}%)")
 
-        # 3. TAKE PROFIT — prediction correct (10% move = 200% return)
+        # 3. TAKE PROFIT
         if pnl_pct >= TAKE_PROFIT:
-            return (cur, f"TAKE_PROFIT ({pnl_pct*100:.1f}%)")
+            return (price, f"TAKE_PROFIT ({pnl_pct*100:.2f}%)")
 
-        # 4. TIME EXIT — only if clearly wrong direction after 1 hour
+        # 4. TIME EXIT
         if age >= MAX_HOLD:
-            vel = fetcher.velocity(pos["symbol"])
-            if pos["side"] == "LONG" and vel < -0.002:
-                return (cur, f"TIME_WRONG (vel={vel*100:.2f}%)")
-            if pos["side"] == "SHORT" and vel > 0.002:
-                return (cur, f"TIME_WRONG (vel={vel*100:.2f}%)")
-            if pnl_pct > 0.02:
-                return (cur, f"TIME_UP ({pnl_pct*100:.1f}%)")
+            return (price, f"TIME_EXIT ({pnl_pct*100:.2f}%)")
 
         return None
 
@@ -341,16 +273,14 @@ class Orchestrator:
         self._equity_log = RUN_DIR / "equity.jsonl"
 
     def run(self):
-        elapsed = (time.time() - self.start_time) / 3600
         logger.info("=" * 60)
-        logger.info("SNIPER V5 — BIG MOVES (3 trades to $100)")
+        logger.info("SNIPER V13 — W ONLY, ALL IN")
         logger.info(f"${INITIAL_CASH} -> ${TARGET} in 6h")
-        logger.info(f"Leverage: {LEVERAGE}x")
-        logger.info(f"SL: {STOP_LOSS*100:.0f}% (100% loss) | TP: {TAKE_PROFIT*100:.0f}% (200% return)")
-        logger.info(f"Peak drop exit: {PEAK_DROP_EXIT*100:.0f}%")
-        logger.info(f"Max hold: {MAX_HOLD/60:.0f} min")
-        logger.info(f"NO stale exit — let winners run")
-        logger.info(f"Assets: {', '.join(ASSETS)}")
+        logger.info(f"Leverage: {LEVERAGE}x | Asset: W ONLY")
+        logger.info(f"Strategy: Catch big W momentum, trail winners")
+        logger.info(f"Signal: 0.5% move in 5 min (bigger signal)")
+        logger.info(f"Position: 95% (ALL IN)")
+        logger.info(f"SL: {STOP_LOSS*100:.1f}% | Trail after {PEAK_TRAIL_ACTIVATE*100:.1f}%")
         logger.info("=" * 60)
 
         while self.running:
@@ -367,10 +297,8 @@ class Orchestrator:
 
     def _tick(self):
         self.tick_count += 1
-        now = time.time()
-        elapsed_h = (now - self.start_time) / 3600
+        elapsed_h = (time.time() - self.start_time) / 3600
 
-        # Safety: stop after 6 hours
         if elapsed_h >= 6.0:
             logger.info(f"6 HOURS REACHED — final cash: ${self.portfolio.cash:.4f}")
             self.running = False
@@ -380,42 +308,29 @@ class Orchestrator:
         if not prices:
             return
 
-        # Check exit first
-        exit_sig = self.portfolio.check_exit(prices, self.fetcher)
-        if exit_sig:
-            price, reason = exit_sig
-            self.portfolio.close(price, reason)
+        # Check exit
+        if self.portfolio.position and "W" in prices:
+            exit_sig = self.portfolio.check_exit(prices["W"])
+            if exit_sig:
+                price, reason = exit_sig
+                self.portfolio.close(price, reason)
 
-        # Find new entry
-        if self.portfolio.can_trade():
-            best = None
-            best_score = -999
-            for sym in ASSETS:
-                p = prices.get(sym)
-                if not p:
-                    continue
-                vel = self.fetcher.velocity(sym)
-                if abs(vel) < 0.0003:
-                    continue
-                sig = self.signal.evaluate(sym, p, self.fetcher)
-                if sig and sig["score"] > best_score:
-                    best_score = sig["score"]
-                    best = (sym, sig)
-
-            if best:
-                sym, sig = best
-                self.portfolio.open(sym, sig["side"], prices[sym], sig["vel"], sig["reasons"])
+        # Find entry
+        if self.portfolio.can_trade() and "W" in prices:
+            sig = self.signal.evaluate("W", prices["W"], self.fetcher)
+            if sig:
+                self.portfolio.open("W", sig["side"], prices["W"], sig["vel"], sig["reasons"])
 
         # Log equity
         equity = self.portfolio.cash
         if self.portfolio.position:
+            cur = prices.get("W", self.portfolio.position["entry_price"])
             pos = self.portfolio.position
-            cur = prices.get(pos["symbol"], pos["entry_price"])
             if pos["side"] == "LONG":
                 pnl = (cur - pos["entry_price"]) / pos["entry_price"] * pos["notional"]
             else:
                 pnl = (pos["entry_price"] - cur) / pos["entry_price"] * pos["notional"]
-            equity = self.portfolio.cash + pnl
+            equity += pnl
 
         with open(self._equity_log, "a") as f:
             f.write(json.dumps({
@@ -428,18 +343,16 @@ class Orchestrator:
                 "wins": self.portfolio.wins,
                 "losses": self.portfolio.losses,
                 "pnl": self.portfolio.total_pnl,
-                "progress": self.portfolio.cash / TARGET * 100,
             }) + "\n")
 
-        # Progress every 60 ticks (~3 min)
         if self.tick_count % 60 == 0:
             ret = (self.portfolio.cash - INITIAL_CASH) / INITIAL_CASH * 100
             logger.info(f"[{elapsed_h:.1f}h] Cash=${self.portfolio.cash:.4f} ({ret:+.1f}%) Trades={self.portfolio.total_trades} WR={self.portfolio.wins}/{self.portfolio.total_trades}")
             if self.portfolio.position:
                 pos = self.portfolio.position
-                cur = prices.get(pos["symbol"], pos["entry_price"])
+                cur = prices.get("W", pos["entry_price"])
                 pnl_pct = (cur - pos["entry_price"]) / pos["entry_price"] * 100
-                logger.info(f"  POS: {pos['side']} {pos['symbol']} peak={pos['peak_pnl_pct']*100:.2f}% cur={pnl_pct:+.3f}%")
+                logger.info(f"  {pos['side']} W peak={pos['peak_pnl_pct']*100:.2f}% cur={pnl_pct:+.3f}%")
 
 
 def main():
