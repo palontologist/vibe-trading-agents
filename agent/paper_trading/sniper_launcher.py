@@ -33,11 +33,15 @@ INITIAL_CASH = float(os.environ.get("INITIAL_CASH", "10"))
 TARGET = 100.0
 LEVERAGE = 20
 POSITION_PCT = 0.95  # 95% per trade (almost all-in)
-TAKE_PROFIT = 0.05  # 5% = 100% with leverage
+TAKE_PROFIT = 0.05  # 5% = 100% with leverage (backup)
 STOP_LOSS = 0.02  # 2% = 40% with leverage
-TRAILING_STOP = 0.015  # 1.5% trailing
-MAX_HOLD = 3600  # 1 hour
-TICK_INTERVAL = 5  # seconds (fast)
+MAX_HOLD = 1800  # 30 min max hold (faster rotation)
+TICK_INTERVAL = 3  # seconds (faster detection)
+
+# MOMENTUM EXIT - the key innovation
+PEAK_DROP_EXIT = 0.40  # Close when PnL drops 40% from peak
+MIN_PROFIT_EXIT = 0.005  # Close if profit > 0.5% after 5 min (take what we can)
+VELOCITY_EXIT = 3  # Close if no new high in 3 ticks (9 seconds)
 
 # Assets ranked by volatility
 ASSETS = ["JUP", "WIF", "SOL", "RENDER", "DOGE", "TURBO"]
@@ -303,6 +307,9 @@ class SniperPortfolio:
             "entry_time": time.time(),
             "highest_price": price,
             "lowest_price": price,
+            "peak_pnl_pct": 0.0,  # Track peak profit
+            "peak_time": time.time(),  # When we hit peak
+            "last_high_tick": 0,  # Tick count of last new high
         }
         self.cash -= (margin + fee)
         self.total_trades += 1
@@ -346,7 +353,7 @@ class SniperPortfolio:
         self._save_state()
         return net_pnl
 
-    def check_exit(self, prices: Dict[str, float]) -> Optional[tuple]:
+    def check_exit(self, prices: Dict[str, float], tick_count: int = 0) -> Optional[tuple]:
         if not self.position:
             return None
 
@@ -365,17 +372,40 @@ class SniperPortfolio:
             pnl_pct = (entry - cur) / entry
             trail_drop = (cur - pos["lowest_price"]) / pos["lowest_price"]
 
-        # Take profit
+        # Update peak PnL tracking
+        if pnl_pct > pos["peak_pnl_pct"]:
+            pos["peak_pnl_pct"] = pnl_pct
+            pos["peak_time"] = time.time()
+            pos["last_high_tick"] = tick_count
+
+        # ── MOMENTUM EXIT LOGIC ──
+        
+        # 1. HARD STOP LOSS - always exit
+        if pnl_pct <= -STOP_LOSS:
+            return (cur, f"STOP LOSS ({pnl_pct*100:.2f}%)")
+        
+        # 2. TAKE PROFIT - if we hit 5%, take it
         if pnl_pct >= TAKE_PROFIT:
             return (cur, f"TAKE PROFIT ({pnl_pct*100:.2f}%)")
-        # Stop loss
-        elif pnl_pct <= -STOP_LOSS:
-            return (cur, f"STOP LOSS ({pnl_pct*100:.2f}%)")
-        # Trailing stop
-        elif trail_drop >= TRAILING_STOP and pnl_pct > 0:
-            return (cur, f"TRAILING STOP ({trail_drop*100:.2f}% from peak)")
-        # Max hold
-        elif age >= MAX_HOLD:
+        
+        # 3. MOMENTUM PEAK EXIT - close when profit drops from peak
+        if pos["peak_pnl_pct"] > 0.005:  # Only if we had >0.5% profit
+            drop_from_peak = pos["peak_pnl_pct"] - pnl_pct
+            drop_pct = drop_from_peak / pos["peak_pnl_pct"]
+            
+            if drop_pct >= PEAK_DROP_EXIT:
+                return (cur, f"PEAK EXIT (peak={pos['peak_pnl_pct']*100:.2f}% now={pnl_pct*100:.2f}% drop={drop_pct*100:.0f}%)")
+        
+        # 4. TAKE WHAT WE CAN - if profitable after 5 min, close
+        if age >= 300 and pnl_pct > MIN_PROFIT_EXIT:
+            return (cur, f"TAKE PROFIT ({pnl_pct*100:.2f}% after {age/60:.1f}min)")
+        
+        # 5. STALE POSITION - no new high in 9 seconds and flat
+        if age >= 30 and pnl_pct < 0.002 and (tick_count - pos["last_high_tick"]) >= VELOCITY_EXIT:
+            return (cur, f"STALE EXIT (no momentum, pnl={pnl_pct*100:.2f}%)")
+        
+        # 6. MAX HOLD - force close
+        if age >= MAX_HOLD:
             return (cur, f"MAX HOLD ({age/60:.0f}min)")
 
         return None
@@ -395,10 +425,13 @@ class SniperOrchestrator:
 
     def run(self):
         logger.info("=" * 60)
-        logger.info("SNIPER — ALL-IN COMPOUND STRATEGY")
+        logger.info("SNIPER V2 — MOMENTUM PEAK STRATEGY")
         logger.info(f"Capital: ${INITIAL_CASH} -> Target: ${TARGET}")
         logger.info(f"Leverage: {LEVERAGE}x | TP: {TAKE_PROFIT*100}% | SL: {STOP_LOSS*100}%")
-        logger.info(f"Strategy: 1 position at a time, compound winnings")
+        logger.info(f"Momentum Exit: Close when profit drops {PEAK_DROP_EXIT*100:.0f}% from peak")
+        logger.info(f"Take What We Can: Close if profitable after 5 min")
+        logger.info(f"Stale Exit: Close if no new high in {VELOCITY_EXIT*3}s")
+        logger.info(f"Max Hold: {MAX_HOLD/60:.0f} min (faster rotation)")
         logger.info("=" * 60)
 
         while self._running:
@@ -427,8 +460,8 @@ class SniperOrchestrator:
         if not prices:
             return
 
-        # Check exit first
-        exit_signal = self.portfolio.check_exit(prices)
+        # Check exit first (with momentum detection)
+        exit_signal = self.portfolio.check_exit(prices, self._tick_count)
         if exit_signal:
             price, reason = exit_signal
             self.portfolio.close_position(price, reason)
