@@ -42,12 +42,15 @@ TICK_INTERVAL = 30  # seconds
 
 # ── 15-Minute Reverse Bot Config ───────────────────────────────────────────────
 REVERSE_15M_TICK = 5  # seconds between scans
-# Real strategy: buy both sides at various price levels
-CHEAP_PRICES = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40]  # underdog side (7 levels)
-MID_PRICES = [0.45, 0.50, 0.55]  # middle ground (3 levels)
-FAVORITE_PRICES = [0.60, 0.65, 0.70, 0.75, 0.80]  # favorite side (5 levels)
-SHARES_PER_LEVEL = 8  # shares per price level (matching real trades)
-ENABLE_HEDGE = True  # place both sides
+# Live strategy: cheap underdog bets + expensive favorite hedges
+CHEAP_BUY_MIN = 0.07  # 7¢ minimum for cheap orders
+CHEAP_BUY_MAX = 0.10  # 10¢ maximum for cheap orders
+EXPENSIVE_BUY_MIN = 0.90  # 90¢ minimum for expensive orders
+EXPENSIVE_BUY_MAX = 0.95  # 95¢ maximum for expensive orders
+CHEAP_ORDER_USDC = 10.0  # $10 per cheap order
+EXPENSIVE_ORDER_USDC = 50.0  # $50 per expensive order
+MAX_SHARES_PER_ORDER = 90  # max shares per order
+ENABLE_EXPENSIVE_HEDGE = True  # place expensive hedge orders
 TARGET_ASSETS = ["btc", "eth"]  # which 15m markets to trade
 
 RUN_DIR = Path("./paper_runs/polymarket_v2")
@@ -406,7 +409,7 @@ class ClobFetcher:
         return slugs
 
     def get_active_15m_markets(self, assets: List[str] = None) -> List[Dict]:
-        """Find active 15-minute Up/Down events for specified assets."""
+        """Find OPEN 15-minute Up/Down events for specified assets."""
         if assets is None:
             assets = TARGET_ASSETS
 
@@ -426,9 +429,6 @@ class ClobFetcher:
 
                 for event in events:
                     for market in event.get("markets", []) or []:
-                        if not market.get("acceptingOrders"):
-                            continue
-
                         market["_event_slug"] = slug
                         market["_event_title"] = event.get("title", "")
                         market["_event_start"] = event.get("startDate")
@@ -437,6 +437,38 @@ class ClobFetcher:
 
             except Exception as e:
                 logger.debug(f"Failed to fetch {slug}: {e}")
+
+        return markets
+
+    def get_all_15m_markets(self, assets: List[str] = None) -> List[Dict]:
+        """Find ALL 15-minute markets including closed (for resolution)."""
+        if assets is None:
+            assets = TARGET_ASSETS
+
+        now = int(time.time())
+        aligned = (now // 900) * 900
+        markets = []
+
+        for asset in assets:
+            for offset in range(-2, 4):
+                ts = aligned + (offset * 900)
+                slug = f"{asset}-updown-15m-{ts}"
+                try:
+                    resp = requests.get(
+                        f"{self.GAMMA_URL}/events",
+                        params={"slug": slug},
+                        timeout=10,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    events = data if isinstance(data, list) else data.get("data", [])
+                    for event in events:
+                        for market in event.get("markets", []) or []:
+                            market["_event_slug"] = slug
+                            market["_event_end"] = event.get("endDate")
+                            markets.append(market)
+                except Exception:
+                    pass
 
         return markets
 
@@ -518,44 +550,63 @@ class Reverse15mSignals:
         import random
         orders = []
 
-        # Generate orders matching live strategy: many levels, variable sizing
-        # Price levels from config
-        all_prices = sorted(CHEAP_PRICES + MID_PRICES + FAVORITE_PRICES)
+        # Live strategy: cheap underdog bets + expensive favorite hedges
+        # Generate cheap prices (7-10¢ in 1¢ increments)
+        cheap_prices = []
+        p = CHEAP_BUY_MIN
+        while p <= CHEAP_BUY_MAX + 0.0001:
+            cheap_prices.append(round(p, 2))
+            p += 0.01
 
-        for side_name, token, current_price in [("up", up_token, up_price), ("down", down_token, down_price)]:
-            # Place orders at each price level
-            for price in all_prices:
-                # Only place orders near current price (within ±20¢)
-                if abs(price - current_price) > 0.20:
-                    continue
+        # Generate expensive prices (90-95¢ in 1¢ increments)
+        expensive_prices = []
+        if ENABLE_EXPENSIVE_HEDGE:
+            p = EXPENSIVE_BUY_MIN
+            while p <= EXPENSIVE_BUY_MAX + 0.0001:
+                expensive_prices.append(round(p, 2))
+                p += 0.01
 
-                # Variable sizing: bigger at cheaper prices, smaller at expensive
-                if price <= 0.30:
-                    size = random.randint(8, 14)  # conviction bets
-                elif price <= 0.50:
-                    size = random.randint(5, 10)  # mid-range
-                else:
-                    size = random.randint(2, 6)   # expensive, smaller
+        # Determine which side is the underdog (reverse token)
+        if up_price < down_price:
+            reverse_token, reverse_price = up_token, up_price
+            favorite_token, favorite_price = down_token, down_price
+            reverse_side = "up"
+            favorite_side = "down"
+        else:
+            reverse_token, reverse_price = down_token, down_price
+            favorite_token, favorite_price = up_token, up_price
+            reverse_side = "down"
+            favorite_side = "up"
 
-                # Adaptive max based on budget
-                max_affordable = int(5.0 / price)
-                size = min(size, max_affordable)
+        # Place cheap orders on reverse (underdog) side
+        for price in cheap_prices:
+            size = min(int(CHEAP_ORDER_USDC / max(price, 0.01)), MAX_SHARES_PER_ORDER)
+            if size >= 1:
+                orders.append({
+                    "token_id": reverse_token,
+                    "side": "BUY",
+                    "price": price,
+                    "size": size,
+                    "leg": reverse_side,
+                    "label": f"{reverse_side.capitalize()}@{price:.2f}",
+                    "order_type": "cheap",
+                })
 
-                if size >= 2:  # minimum viable order
-                    orders.append({
-                        "token_id": token,
-                        "side": "BUY",
-                        "price": price,
-                        "size": size,
-                        "leg": side_name,
-                        "label": f"{side_name.capitalize()}@{price:.2f}",
-                    })
+        # Place expensive orders on favorite side
+        for price in expensive_prices:
+            size = min(int(EXPENSIVE_ORDER_USDC / max(price, 0.01)), MAX_SHARES_PER_ORDER)
+            if size >= 1:
+                orders.append({
+                    "token_id": favorite_token,
+                    "side": "BUY",
+                    "price": price,
+                    "size": size,
+                    "leg": favorite_side,
+                    "label": f"{favorite_side.capitalize()}@{price:.2f}",
+                    "order_type": "expensive",
+                })
 
-        # Ensure we have orders on BOTH sides
-        up_orders = [o for o in orders if o["leg"] == "up"]
-        down_orders = [o for o in orders if o["leg"] == "down"]
-
-        if not up_orders or not down_orders:
+        if not orders:
             return None
 
         return {
@@ -587,8 +638,8 @@ class Reverse15mOrchestrator:
         logger.info("=" * 60)
         logger.info("POLYMARKET 15-MINUTE REVERSE BOT (AUTO-REENTRY)")
         logger.info(f"Capital: ${INITIAL_CASH} | Paper mode: True")
-        logger.info(f"Cheap: {CHEAP_PRICES} | Mid: {MID_PRICES} | Fav: {FAVORITE_PRICES}")
-        logger.info(f"Shares/level: {SHARES_PER_LEVEL} | Both sides: {ENABLE_HEDGE}")
+        logger.info(f"Cheap: {CHEAP_BUY_MIN}-{CHEAP_BUY_MAX} | Expensive: {EXPENSIVE_BUY_MIN}-{EXPENSIVE_BUY_MAX}")
+        logger.info(f"Budgets: ${CHEAP_ORDER_USDC} cheap | ${EXPENSIVE_ORDER_USDC} expensive | Max: {MAX_SHARES_PER_ORDER} shares")
         logger.info(f"Assets: {TARGET_ASSETS} | Tick: {REVERSE_15M_TICK}s")
         logger.info("=" * 60)
 
@@ -612,9 +663,11 @@ class Reverse15mOrchestrator:
             return
 
         # Check for resolved positions
-        self._check_resolved(markets)
+        # Check for resolved positions (uses all markets including closed)
+        all_markets = self.fetcher.get_all_15m_markets()
+        self._check_resolved(all_markets)
 
-        # Find best active market that generates valid signals
+        # Find best OPEN market that generates valid signals
         best_market = None
         best_signal = None
         for market in markets:
@@ -622,19 +675,14 @@ class Reverse15mOrchestrator:
             if not condition_id:
                 continue
 
+            # Skip closed markets
+            if not market.get("acceptingOrders", False):
+                continue
+
             # Skip if we already traded this window
             if condition_id in self._placed_this_window:
-                event_end = market.get("_event_end", "")
-                if event_end:
-                    try:
-                        end_dt = datetime.fromisoformat(event_end.replace("Z", "+00:00"))
-                        now = datetime.now(timezone.utc)
-                        if now > end_dt:
-                            continue
-                    except Exception:
-                        pass
-                # Already have 4 orders per side (8 total), skip
-                if len(self._placed_this_window.get(condition_id, set())) >= 8:
+                # Already have enough orders, skip
+                if len(self._placed_this_window.get(condition_id, set())) >= 10:
                     continue
 
             # Try to generate signal — skip lopsided markets
@@ -680,10 +728,21 @@ class Reverse15mOrchestrator:
 
             cost = order["price"] * order["size"]
             side = order["leg"]
+            order_type = order.get("order_type", "cheap")
 
-            # Check per-side budget
-            side_spent = up_spent if side == "up" else down_spent
-            if side_spent + cost > cash_per_side:
+            # Check budget per order type
+            if order_type == "cheap":
+                budget = CHEAP_ORDER_USDC
+            else:
+                budget = EXPENSIVE_ORDER_USDC
+
+            # Track spending per type for this window
+            type_key = f"{condition_id}_{order_type}"
+            if not hasattr(self, '_type_spent'):
+                self._type_spent = {}
+            type_spent = self._type_spent.get(type_key, 0)
+
+            if type_spent + cost > budget:
                 continue
 
             if cost > self.portfolio.cash:
@@ -700,15 +759,10 @@ class Reverse15mOrchestrator:
                 event_end=signal.get("event_end", ""),
             )
             placed.add(price_label)
-
-            # Update side spent tracking
-            if side == "up":
-                up_spent += cost
-            else:
-                down_spent += cost
+            self._type_spent[type_key] = type_spent + cost
 
             logger.info(
-                f"PLACED: {order['leg'].upper()} {price_label} | "
+                f"PLACED: {order_type.upper()} {order['leg'].upper()} {price_label} | "
                 f"{order['size']} shares @ ${order['price']:.2f} | "
                 f"Cost=${cost:.2f} | Cash=${self.portfolio.cash:.2f}"
             )
