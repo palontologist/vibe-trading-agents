@@ -43,9 +43,9 @@ TICK_INTERVAL = 30  # seconds
 # ── 15-Minute Reverse Bot Config ───────────────────────────────────────────────
 REVERSE_15M_TICK = 5  # seconds between scans
 # Real strategy: buy both sides at various price levels
-CHEAP_PRICES = [0.25, 0.30, 0.35, 0.40]  # underdog side
-MID_PRICES = [0.45, 0.50, 0.55]  # middle ground
-FAVORITE_PRICES = [0.60, 0.65, 0.70, 0.75]  # favorite side
+CHEAP_PRICES = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40]  # underdog side (7 levels)
+MID_PRICES = [0.45, 0.50, 0.55]  # middle ground (3 levels)
+FAVORITE_PRICES = [0.60, 0.65, 0.70, 0.75, 0.80]  # favorite side (5 levels)
 SHARES_PER_LEVEL = 8  # shares per price level (matching real trades)
 ENABLE_HEDGE = True  # place both sides
 TARGET_ASSETS = ["btc", "eth"]  # which 15m markets to trade
@@ -518,25 +518,38 @@ class Reverse15mSignals:
         import random
         orders = []
 
-        # Generate 4 orders for EACH side, centered around current price
+        # Generate orders matching live strategy: many levels, variable sizing
+        # Price levels from config
+        all_prices = sorted(CHEAP_PRICES + MID_PRICES + FAVORITE_PRICES)
+
         for side_name, token, current_price in [("up", up_token, up_price), ("down", down_token, down_price)]:
-            # Calculate offsets to place orders below current price
-            offsets = [0.0, -0.03, -0.06, -0.09]
-            for offset in offsets:
-                price = round(current_price + offset, 2)
-                if 0.20 <= price <= 0.80:
-                    # Adaptive size: more shares at cheaper prices, fewer at expensive
-                    max_affordable = int(5.0 / price)  # ~$5 per side budget
-                    size = min(random.randint(5, 13), max_affordable)
-                    if size >= 3:  # minimum viable order
-                        orders.append({
-                            "token_id": token,
-                            "side": "BUY",
-                            "price": price,
-                            "size": size,
-                            "leg": side_name,
-                            "label": f"{side_name.capitalize()}@{price:.2f}",
-                        })
+            # Place orders at each price level
+            for price in all_prices:
+                # Only place orders near current price (within ±20¢)
+                if abs(price - current_price) > 0.20:
+                    continue
+
+                # Variable sizing: bigger at cheaper prices, smaller at expensive
+                if price <= 0.30:
+                    size = random.randint(8, 14)  # conviction bets
+                elif price <= 0.50:
+                    size = random.randint(5, 10)  # mid-range
+                else:
+                    size = random.randint(2, 6)   # expensive, smaller
+
+                # Adaptive max based on budget
+                max_affordable = int(5.0 / price)
+                size = min(size, max_affordable)
+
+                if size >= 2:  # minimum viable order
+                    orders.append({
+                        "token_id": token,
+                        "side": "BUY",
+                        "price": price,
+                        "size": size,
+                        "leg": side_name,
+                        "label": f"{side_name.capitalize()}@{price:.2f}",
+                    })
 
         # Ensure we have orders on BOTH sides
         up_orders = [o for o in orders if o["leg"] == "up"]
