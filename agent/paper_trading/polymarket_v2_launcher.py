@@ -294,6 +294,7 @@ class PolymarketPortfolio:
         shares: float,
         question: str,
         leg: str,
+        event_end: str = "",
     ):
         """Record a placed order as a position for the 15m reverse bot."""
         position_key = f"{condition_id}_{price_label}"
@@ -309,6 +310,7 @@ class PolymarketPortfolio:
             "question": question,
             "leg": leg,
             "resolved": False,
+            "event_end": event_end,
         }
         self.cash -= cost
         self.total_invested += cost
@@ -397,8 +399,8 @@ class ClobFetcher:
 
         slugs = []
         for asset in assets:
-            # Check current window + next 3 windows
-            for offset in range(0, 4):
+            # Check previous window (for resolution) + current + next 3
+            for offset in range(-1, 4):
                 ts = aligned + (offset * 900)
                 slugs.append(f"{asset}-updown-15m-{ts}")
         return slugs
@@ -523,15 +525,18 @@ class Reverse15mSignals:
             for offset in offsets:
                 price = round(current_price + offset, 2)
                 if 0.20 <= price <= 0.80:
-                    size = random.randint(5, 13)
-                    orders.append({
-                        "token_id": token,
-                        "side": "BUY",
-                        "price": price,
-                        "size": size,
-                        "leg": side_name,
-                        "label": f"{side_name.capitalize()}@{price:.2f}",
-                    })
+                    # Adaptive size: more shares at cheaper prices, fewer at expensive
+                    max_affordable = int(5.0 / price)  # ~$5 per side budget
+                    size = min(random.randint(5, 13), max_affordable)
+                    if size >= 3:  # minimum viable order
+                        orders.append({
+                            "token_id": token,
+                            "side": "BUY",
+                            "price": price,
+                            "size": size,
+                            "leg": side_name,
+                            "label": f"{side_name.capitalize()}@{price:.2f}",
+                        })
 
         # Ensure we have orders on BOTH sides
         up_orders = [o for o in orders if o["leg"] == "up"]
@@ -679,6 +684,7 @@ class Reverse15mOrchestrator:
                 shares=order["size"],
                 question=signal["question"],
                 leg=order["leg"],
+                event_end=signal.get("event_end", ""),
             )
             placed.add(price_label)
 
@@ -700,16 +706,35 @@ class Reverse15mOrchestrator:
         if self._tick_count % 30 == 0:
             self._print_progress(equity)
 
-    def _check_resolved(self, markets: List[Dict]):
+    def _check_resolved(self, active_markets: List[Dict]):
         """Check if any positions have resolved based on market end times."""
         now = datetime.now(timezone.utc)
         resolved_any = False
 
-        for market in markets:
-            condition_id = market.get("conditionId", "")
-            event_end = market.get("_event_end", "")
+        # Build price lookup from active markets
+        price_map = {}
+        for market in active_markets:
+            cid = market.get("conditionId", "")
+            prices_raw = market.get("outcomePrices", "[]")
+            if isinstance(prices_raw, str):
+                try:
+                    prices = json.loads(prices_raw)
+                except Exception:
+                    continue
+            else:
+                prices = prices_raw
+            if len(prices) >= 2:
+                price_map[cid] = (float(prices[0]), float(prices[1]))
 
-            if not condition_id or not event_end:
+        # Check all unresolved positions
+        for key, pos in list(self.portfolio.positions.items()):
+            if pos.get("resolved"):
+                continue
+
+            condition_id = pos.get("condition_id", "")
+            event_end = pos.get("event_end", "")
+
+            if not event_end:
                 continue
 
             try:
@@ -720,31 +745,34 @@ class Reverse15mOrchestrator:
             if now <= end_dt:
                 continue  # Window still open
 
-            # Check if we have positions on this market
-            has_positions = any(
-                p.get("condition_id") == condition_id and not p.get("resolved")
-                for p in self.portfolio.positions.values()
-            )
-            if not has_positions:
-                continue
-
-            # Get the winning outcome from outcomePrices
-            prices_raw = market.get("outcomePrices", "[]")
-            if isinstance(prices_raw, str):
+            # Window ended — determine winner from prices
+            if condition_id in price_map:
+                up_price, down_price = price_map[condition_id]
+            else:
+                # Market closed and no longer in active list — re-fetch once
                 try:
-                    prices = json.loads(prices_raw)
+                    resp = requests.get(
+                        f"{self.fetcher.GAMMA_URL}/markets",
+                        params={"conditionId": condition_id},
+                        timeout=10,
+                    )
+                    data = resp.json()
+                    markets = data if isinstance(data, list) else data.get("data", [])
+                    if markets:
+                        m = markets[0]
+                        prices_raw = m.get("outcomePrices", "[]")
+                        if isinstance(prices_raw, str):
+                            prices = json.loads(prices_raw)
+                        else:
+                            prices = prices_raw
+                        up_price = float(prices[0])
+                        down_price = float(prices[1])
+                    else:
+                        continue
                 except Exception:
                     continue
-            else:
-                prices = prices_raw
 
-            if len(prices) < 2:
-                continue
-
-            up_price = float(prices[0])
-            down_price = float(prices[1])
-
-            # Determine winner: price close to 1 = winner
+            # Determine winner
             if up_price > 0.9:
                 winning = "up"
             elif down_price > 0.9:
@@ -752,13 +780,29 @@ class Reverse15mOrchestrator:
             else:
                 continue  # Can't determine winner yet
 
-            # Resolve positions
-            self.portfolio.resolve_positions(condition_id, winning)
+            # Resolve this position
+            label = pos.get("price_label", "")
+            if winning.lower() in label.lower():
+                payout = pos["shares"] * 1.0
+                pnl = payout - pos["notional"]
+            else:
+                payout = 0.0
+                pnl = -pos["notional"]
+
+            pos["resolved"] = True
+            self.portfolio.cash += payout
+            self.portfolio.total_pnl += pnl
+            if pnl > 0:
+                self.portfolio.wins += 1
+            self.portfolio._save_state()
+
             resolved_any = True
-            logger.info(f"RESOLVED: {market.get('question', '')[:40]} → {winning.upper()} won")
+            logger.info(
+                f"RESOLVED: {pos['question'][:40]} | {pos['price_label']} | "
+                f"PnL=${pnl:+.2f} | Cash=${self.portfolio.cash:.2f}"
+            )
 
         if resolved_any:
-            # Clean up old windows from placed tracking
             self._cleanup_old_windows()
 
     def _cleanup_old_windows(self):
