@@ -7,10 +7,11 @@ Two strategies in one file:
    - BUY NO on longshots (<0.30 prob)
    - Quick in/out — TP 5%, SL 10%
 
-2. 15-MINUTE REVERSE BOT: Dual-leg limit orders on BTC/ETH Up/Down windows
-   - Cheap leg: BUY underdog @ 7-10¢ (reversal bet, 10-14x payout)
-   - Hedge leg: BUY favorite @ 90-95¢ (small profit if favorite holds)
-   - Hold to resolution — no selling
+2. 15-MINUTE REVERSE BOT: DCA both sides on BTC/ETH Up/Down windows
+   - Buy BOTH sides (Up AND Down) at current market price
+   - Scale in over time — multiple orders per side
+   - Typical entry: 20¢-70¢ range
+   - Hold to resolution — one side wins $1, one side worth $0
    - Scans every 5 seconds for new 15m windows
 
 Run modes:
@@ -32,7 +33,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-INITIAL_CASH = float(os.environ.get("INITIAL_CASH", "10"))
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+INITIAL_CASH = float(os.environ.get("INITIAL_CASH", "9.57"))
 MAX_POSITION_PCT = 0.25  # 25% per market
 MAX_POSITIONS = 8
 TAKE_PROFIT_PCT = 0.05  # 5%
@@ -40,21 +43,182 @@ STOP_LOSS_PCT = 0.10  # 10%
 MIN_VOLUME_24H = 50000  # $50K minimum
 TICK_INTERVAL = 30  # seconds
 
-# ── 15-Minute Reverse Bot Config ───────────────────────────────────────────────
-REVERSE_15M_TICK = 5  # seconds between scans
-# Live strategy: cheap underdog bets + expensive favorite hedges
-CHEAP_BUY_MIN = 0.07  # 7¢ minimum for cheap orders
-CHEAP_BUY_MAX = 0.10  # 10¢ maximum for cheap orders
-EXPENSIVE_BUY_MIN = 0.90  # 90¢ minimum for expensive orders
-EXPENSIVE_BUY_MAX = 0.95  # 95¢ maximum for expensive orders
-CHEAP_ORDER_USDC = 10.0  # $10 per cheap order
-EXPENSIVE_ORDER_USDC = 50.0  # $50 per expensive order
-MAX_SHARES_PER_ORDER = 90  # max shares per order
-ENABLE_EXPENSIVE_HEDGE = True  # place expensive hedge orders
-TARGET_ASSETS = ["btc", "eth"]  # which 15m markets to trade
+# ── Ultra-Cheap Dislocation Strategy ─────────────────────────────────────────
 
-RUN_DIR = Path("./paper_runs/polymarket_v2")
+class UltraCheapLiveSignals:
+    """Generate deep-discount limit orders for 15m windows."""
+    def __init__(self):
+        self.cheap_prices = [0.05, 0.07, 0.10]
+
+    def analyze_market(self, market: Dict) -> Optional[Dict[str, Any]]:
+        outcomes_raw = market.get("outcomes", "[]")
+        clob_ids_raw = market.get("clobTokenIds", "[]")
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        clob_ids = json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
+
+        if len(outcomes) != 2 or len(clob_ids) != 2: return None
+
+        orders = []
+        for i in range(2): # Both sides
+            token_id = clob_ids[i]
+            outcome = outcomes[i]
+            for price in self.cheap_prices:
+                orders.append({
+                    "token_id": token_id,
+                    "price": price,
+                    "size": 10, # Small fixed sizing
+                    "leg": outcome,
+                    "label": f"{outcome}@{price:.2f}",
+                })
+        return {"question": market.get("question", ""), "condition_id": market.get("conditionId", ""), "orders": orders}
+
+class UltraCheapLiveOrchestrator:
+    """Live loop for Ultra-Cheap Dislocation strategy."""
+    def __init__(self, live: bool = True):
+        self.fetcher = ClobFetcher()
+        self.signals = UltraCheapLiveSignals()
+        self.portfolio = PolymarketPortfolio(INITIAL_CASH, state_path=LIVE_STATE)
+        self.live = live
+        self.trader = LiveTrader() if live else None
+        if live: self.portfolio.sync_cash_from_clob(self.trader.balance_usd)
+        self._tick_count = 0
+        self._placed_windows: Dict[str, Set[str]] = {}
+        self._live_orders: Dict[str, Dict] = {} # order_id -> details
+
+    def run(self):
+        logger.info("=" * 60)
+        logger.info("ULTRA-CHEAP LIVE BOT (Sprinting with $1)")
+        logger.info(f"Budget: ${self.portfolio.cash:.2f} | Entries: [0.05, 0.07, 0.10]")
+        logger.info("=" * 60)
+        while True:
+            try:
+                self._tick()
+                time.sleep(5)
+            except KeyboardInterrupt: break
+            except Exception as e:
+                logger.error(f"Tick error: {e}", exc_info=True)
+                time.sleep(10)
+
+    def _tick(self):
+        self._tick_count += 1
+        markets = self.fetcher.get_active_15m_markets()
+        
+        # 1. Check for Resolutions (New)
+        all_markets = self.fetcher.get_all_15m_markets()
+        self._check_resolved(all_markets)
+
+        # 2. Check Fills
+        if self.live and self.trader:
+            open_orders = {o.get("id") for o in self.trader.get_open_orders()}
+            for oid in list(self._live_orders.keys()):
+                if oid not in open_orders:
+                    details = self._live_orders.pop(oid)
+                    logger.info(f"FILL: {details['leg']} {details['label']} matched!")
+                    self.portfolio.record_order(details['cid'], details['label'], 
+                                              details['price']*details['size'], details['size'], 
+                                              details['q'], details['leg'])
+
+        # 3. Place New Limits
+        for m in markets:
+            cid = m.get("conditionId", "")
+            if not cid or not m.get("acceptingOrders", False): continue
+            if cid in self._placed_windows and len(self._placed_windows[cid]) >= 12: continue
+            
+            sig = self.signals.analyze_market(m)
+            if not sig: continue
+            
+            if cid not in self._placed_windows: self._placed_windows[cid] = set()
+            
+            for order in sig["orders"]:
+                label = order["label"]
+                if label in self._placed_windows[cid]: continue
+                
+                cost = order["price"] * order["size"]
+                if cost > self.portfolio.cash: continue
+                
+                live_res = self.trader.place_limit_buy(order["token_id"], order["price"], order["size"])
+                if live_res:
+                    oid = live_res["order_id"]
+                    self._live_orders[oid] = {
+                        "cid": cid, "label": label, "price": order["price"], 
+                        "size": order["size"], "leg": order["leg"], "q": sig["question"]
+                    }
+                    self._placed_windows[cid].add(label)
+                    self.portfolio.record_order(cid, label, cost, order["size"], sig["question"], order["leg"])
+                    logger.info(f"[LIVE-LIMIT] {label} placed for {cid[:8]}")
+
+        if self._tick_count % 20 == 0:
+            logger.info(f"Tick {self._tick_count}: Cash=${self.portfolio.cash:.2f} | Pending={len(self._live_orders)}")
+
+    def _check_resolved(self, active_markets: List[Dict]):
+        """Check if any positions have resolved based on market end times."""
+        now = datetime.now(timezone.utc)
+        resolved_any = False
+
+        price_map = {}
+        for market in active_markets:
+            cid = market.get("conditionId", "")
+            prices_raw = market.get("outcomePrices", "[]")
+            if isinstance(prices_raw, str):
+                try: prices = json.loads(prices_raw)
+                except Exception: continue
+            else: prices = prices_raw
+            if len(prices) >= 2: price_map[cid] = (float(prices[0]), float(prices[1]))
+
+        for key, pos in list(self.portfolio.positions.items()):
+            if pos.get("resolved"): continue
+            condition_id = pos.get("condition_id", "")
+            event_end = pos.get("event_end", "")
+            if not event_end: continue
+            try:
+                end_dt = datetime.fromisoformat(event_end.replace("Z", "+00:00"))
+            except Exception: continue
+            if now <= end_dt: continue
+
+            if condition_id in price_map:
+                up_price, down_price = price_map[condition_id]
+            else:
+                continue
+
+            if up_price > 0.9: winning = "up"
+            elif down_price > 0.9: winning = "down"
+            else: continue
+
+            label = pos.get("price_label", "")
+            is_winner = winning.lower() in label.lower()
+            payout = pos["shares"] * 1.0 if is_winner else 0.0
+            pnl = payout - pos["notional"]
+
+            pos["resolved"] = True
+            self.portfolio.cash += payout
+            self.portfolio.total_pnl += pnl
+            if is_winner: self.portfolio.wins += 1
+            self.portfolio._save_state()
+            resolved_any = True
+            logger.info(f"RESOLVED: {pos['question'][:40]} | {label} | {'WIN' if is_winner else 'LOSS'} | PnL=${pnl:+.2f} | Cash=${self.portfolio.cash:.2f}")
+
+        if resolved_any:
+            self._placed_windows.clear()
+REVERSE_15M_TICK = 5  # seconds between scans
+# Real strategy (observed from owner): ALL-IN underdog side, NO hedge
+# Buy UP on both BTC and ETH at 20¢-35¢ limit, DCA climbing the ladder
+# 90 shares max per order, multiple price levels
+CHEAP_BUY_MIN = 0.20   # cheapest limit for underdog
+CHEAP_BUY_MAX = 0.35   # climb up to 35¢
+CHEAP_ORDER_USDC = 1.80  # $1.80 per order (90 shares × 20¢)
+MAX_SHARES_PER_ORDER = 90  # max shares per order (matches owner)
+ENABLE_EXPENSIVE_HEDGE = False  # NO hedge — owner goes all-in same direction
+EXPENSIVE_BUY_MIN = 0.84  # unused when hedge disabled
+EXPENSIVE_BUY_MAX = 0.85  # unused when hedge disabled
+EXPENSIVE_ORDER_USDC = 1.00  # unused when hedge disabled
+TARGET_ASSETS = ["btc", "eth"]  # trade BOTH BTC and ETH on same window
+
+RUN_DIR = Path(__file__).resolve().parent.parent / "paper_runs" / "polymarket_v2"
 RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+# Separate state files for paper vs live
+PAPER_STATE = RUN_DIR / "paper_state.json"
+LIVE_STATE = RUN_DIR / "live_state.json"
 
 
 class PolymarketFetcher:
@@ -175,7 +339,7 @@ class ReversedSignals:
 class PolymarketPortfolio:
     """Paper portfolio for Polymarket trading."""
 
-    def __init__(self, initial_cash: float = 10.0):
+    def __init__(self, initial_cash: float = 10.0, state_path: Path = None):
         self.cash = initial_cash
         self.initial_cash = initial_cash
         self.positions: Dict[str, Dict] = {}
@@ -183,11 +347,12 @@ class PolymarketPortfolio:
         self.wins = 0
         self.losses = 0
         self.total_pnl = 0.0
-        self.total_invested = 0.0  # for 15m reverse bot tracking
+        self.total_invested = 0.0
+        self._state_file = state_path or PAPER_STATE
         self._load_state()
 
     def _state_path(self):
-        return RUN_DIR / "state.json"
+        return self._state_file
 
     def _load_state(self):
         p = self._state_path()
@@ -218,6 +383,17 @@ class PolymarketPortfolio:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._state_path().write_text(json.dumps(state, indent=2))
+
+    def sync_cash_from_clob(self, clob_balance: float):
+        """Sync portfolio cash with actual CLOB balance. Clear stale paper state."""
+        old_cash = self.cash
+        self.cash = clob_balance
+        resolved = [p for p in self.positions.values() if p.get("resolved")]
+        active = {k: v for k, v in self.positions.items() if not v.get("resolved")}
+        self.positions = active
+        self.total_invested = sum(p.get("notional", 0) for p in active.values())
+        self._save_state()
+        logger.info(f"Portfolio synced: CLOB=${clob_balance:.2f} (was ${old_cash:.2f}) | Active={len(active)} Resolved={len(resolved)}")
 
     def _calc_equity(self) -> float:
         equity = self.cash
@@ -298,6 +474,7 @@ class PolymarketPortfolio:
         question: str,
         leg: str,
         event_end: str = "",
+        order_id: Optional[str] = None,
     ):
         """Record a placed order as a position for the 15m reverse bot."""
         position_key = f"{condition_id}_{price_label}"
@@ -314,6 +491,7 @@ class PolymarketPortfolio:
             "leg": leg,
             "resolved": False,
             "event_end": event_end,
+            "order_id": order_id,
         }
         self.cash -= cost
         self.total_invested += cost
@@ -487,13 +665,193 @@ class ClobFetcher:
             return None
 
 
-class Reverse15mSignals:
-    """Generate dual-leg order signals for 15-minute Up/Down markets.
+class LiveTrader:
+    """Place real orders on Polymarket CLOB using py-clob-client-v2."""
 
-    Real strategy: Buy BOTH sides at current market prices.
-    - Place limit orders at/near current best ask on both sides
-    - Variable order sizes (5-15 shares)
-    - Multiple orders per side as price moves
+    CLOB_HOST = "https://clob.polymarket.com"
+    CHAIN_ID = 137
+    DEPOSIT_WALLET = "0x3B4D8B57a729799a49ce259580cADaC29B4d1aB8"
+    PRIVATE_KEY = os.environ.get(
+        "POLYMARKET_PRIVATE_KEY",
+        "09e99c8392099bf891f45a73d7854329486dd640bb857f2c245ec54ad7d27ac8",
+    )
+
+    def __init__(self):
+        self._client = None
+        self._init_client()
+
+    def _init_client(self):
+        try:
+            from py_clob_client_v2 import ClobClient, ApiCreds
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams
+
+            boot = ClobClient(
+                host=self.CLOB_HOST,
+                chain_id=self.CHAIN_ID,
+                key=self.PRIVATE_KEY,
+                signature_type=3,
+                funder=self.DEPOSIT_WALLET,
+            )
+            # Try derive creds (reuse existing)
+            try:
+                creds = boot.derive_api_key()
+            except Exception:
+                creds = boot.create_or_derive_api_key()
+
+            self._client = ClobClient(
+                host=self.CLOB_HOST,
+                chain_id=self.CHAIN_ID,
+                key=self.PRIVATE_KEY,
+                creds=creds,
+                signature_type=3,
+                funder=self.DEPOSIT_WALLET,
+            )
+
+            # Sync balance
+            params = BalanceAllowanceParams(asset_type="COLLATERAL", signature_type=3)
+            self._client.update_balance_allowance(params)
+            bal = self._client.get_balance_allowance(params)
+            self._balance = int(bal.get("balance", 0))
+            logger.info(f"LIVE TRADER: Deposit wallet {self.DEPOSIT_WALLET[:12]}... | Balance: ${self._balance / 10**6:.2f}")
+
+        except Exception as e:
+            logger.error(f"Failed to init live trader: {e}")
+            self._client = None
+
+    @property
+    def balance_usd(self) -> float:
+        return self._balance / 10**6 if self._balance else 0.0
+
+    def refresh_balance(self):
+        if not self._client:
+            return
+        try:
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams
+            params = BalanceAllowanceParams(asset_type="COLLATERAL", signature_type=3)
+            self._client.update_balance_allowance(params)
+            bal = self._client.get_balance_allowance(params)
+            self._balance = int(bal.get("balance", 0))
+        except Exception as e:
+            logger.warning(f"Balance refresh failed: {e}")
+
+    def place_limit_buy(self, token_id: str, price: float, size: int) -> Optional[Dict]:
+        """Place a GTC limit BUY order. Returns order dict or None."""
+        if not self._client:
+            logger.error("Live trader not initialized")
+            return None
+
+        if size < 5:
+            logger.warning(f"Size {size} below minimum (5), skipping")
+            return None
+
+        # Enforce $1 minimum order value
+        if price * size < 1.0:
+            size = max(5, int(1.0 / price) + 1)
+            logger.info(f"Adjusted size to {size} to meet $1 minimum")
+
+        try:
+            from py_clob_client_v2 import OrderType, Side
+            from py_clob_client_v2.clob_types import OrderArgs, CreateOrderOptions
+
+            resp = self._client.create_and_post_order(
+                OrderArgs(
+                    price=price,
+                    size=size,
+                    side=Side.BUY,
+                    token_id=token_id,
+                ),
+                CreateOrderOptions(tick_size="0.01", neg_risk=False),
+                OrderType.GTC,
+            )
+
+            if resp.get("success"):
+                logger.info(f"LIVE ORDER: BUY {size} @ ${price:.2f} | ID={resp.get('orderID', '?')[:16]}...")
+                return {
+                    "order_id": resp.get("orderID"),
+                    "status": resp.get("status"),
+                    "price": price,
+                    "size": size,
+                }
+            else:
+                logger.warning(f"Order failed: {resp}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Order error: {e}")
+            return None
+
+    def cancel_order(self, order_id: str) -> bool:
+        if not self._client:
+            return False
+        try:
+            self._client.cancel(order_id)
+            return True
+        except Exception as e:
+            logger.warning(f"Cancel failed: {e}")
+            return False
+
+    def cancel_all(self) -> bool:
+        if not self._client:
+            return False
+        try:
+            self._client.cancel_all()
+            return True
+        except Exception as e:
+            logger.warning(f"Cancel all failed: {e}")
+            return False
+
+    def get_open_orders(self) -> List[Dict]:
+        """Get all open orders for the deposit wallet."""
+        if not self._client:
+            return []
+        try:
+            orders = self._client.get_open_orders()
+            return orders if isinstance(orders, list) else []
+        except Exception as e:
+            logger.warning(f"Get open orders failed: {e}")
+            return []
+
+    def check_order_status(self, order_id: str) -> Optional[str]:
+        """Check if an order is filled, open, or cancelled."""
+        if not self._client:
+            return None
+        try:
+            order = self._client.get_order(order_id)
+            if order:
+                return order.get("status", "unknown")
+        except Exception:
+            pass
+        return None
+
+    def cancel_stale_orders(self, max_age_seconds: int = 900) -> int:
+        """Cancel orders older than max_age_seconds (default 15 min)."""
+        if not self._client:
+            return 0
+        try:
+            orders = self.get_open_orders()
+            cancelled = 0
+            now = time.time()
+            for order in orders:
+                created = order.get("createdAt", 0)
+                if isinstance(created, (int, float)) and (now - created) > max_age_seconds:
+                    oid = order.get("id", "")
+                    if oid:
+                        self.cancel_order(oid)
+                        cancelled += 1
+            return cancelled
+        except Exception as e:
+            logger.warning(f"Cancel stale failed: {e}")
+            return 0
+
+
+class Reverse15mSignals:
+    """Generate order signals matching the original TypeScript strategy.
+
+    Strategy:
+    - CHEAP: Buy the underdog (cheapest side) at 7¢-10¢ limit
+    - EXPENSIVE: Hedge by buying the favorite at 90¢-95¢ limit
+    - Place limit orders across the price range
+    - Hold to resolution — one side wins $1, other goes to $0
     """
 
     def __init__(self, fetcher: ClobFetcher):
@@ -518,8 +876,38 @@ class Reverse15mSignals:
         except (ValueError, IndexError):
             return None, None
 
+    def _cheap_limit_prices(self) -> List[float]:
+        """Generate cheap limit prices: 0.20, 0.25, 0.30, 0.35 (DCA ladder)"""
+        prices = []
+        p = CHEAP_BUY_MIN
+        while p <= CHEAP_BUY_MAX + 0.0001:
+            prices.append(round(p, 2))
+            p += 0.05  # 5¢ increments like the real owner
+        return prices
+
+    def _expensive_limit_prices(self) -> List[float]:
+        """Generate expensive limit prices: 0.90, 0.91, 0.92, 0.93, 0.94, 0.95"""
+        prices = []
+        p = EXPENSIVE_BUY_MIN
+        while p <= EXPENSIVE_BUY_MAX + 0.0001:
+            prices.append(round(p, 2))
+            p += 0.01
+        return prices
+
+    def _compute_size(self, usdc_budget: float, price: float) -> int:
+        """Compute share size capped at MAX_SHARES_PER_ORDER."""
+        shares = usdc_budget / max(price, 0.01)
+        capped = min(shares, MAX_SHARES_PER_ORDER)
+        return max(1, int(capped))
+
     def analyze_market(self, market: Dict) -> Optional[Dict[str, Any]]:
-        """Analyze a 15m market and return order signals for both sides."""
+        """Analyze a 15m market and return cheap + expensive order signals.
+
+        Matches TypeScript findOpportunities():
+        - pickReverseToken: cheapest side with bestAsk
+        - cheap orders: buy underdog at 7¢-10¢
+        - expensive hedge: buy favorite at 90¢-95¢
+        """
         outcomes_raw = market.get("outcomes", "[]")
         clob_ids_raw = market.get("clobTokenIds", "[]")
 
@@ -547,64 +935,36 @@ class Reverse15mSignals:
         condition_id = market.get("conditionId", "")
         event_end = market.get("_event_end", "")
 
-        import random
+        # pickReverseToken: the CHEAPER outcome is the underdog
+        if up_price <= down_price:
+            reverse_token = up_token
+            reverse_price = up_price
+            reverse_outcome = "up"
+            favorite_token = down_token
+            favorite_price = down_price
+        else:
+            reverse_token = down_token
+            reverse_price = down_price
+            reverse_outcome = "down"
+            favorite_token = up_token
+            favorite_price = up_price
+
         orders = []
 
-        # Live strategy: cheap underdog bets + expensive favorite hedges
-        # Generate cheap prices (7-10¢ in 1¢ increments)
-        cheap_prices = []
-        p = CHEAP_BUY_MIN
-        while p <= CHEAP_BUY_MAX + 0.0001:
-            cheap_prices.append(round(p, 2))
-            p += 0.01
+        # Real strategy: ALL-IN underdog side at DCA price ladder, NO hedge
+        cheap_prices = self._cheap_limit_prices()
 
-        # Generate expensive prices (90-95¢ in 1¢ increments)
-        expensive_prices = []
-        if ENABLE_EXPENSIVE_HEDGE:
-            p = EXPENSIVE_BUY_MIN
-            while p <= EXPENSIVE_BUY_MAX + 0.0001:
-                expensive_prices.append(round(p, 2))
-                p += 0.01
-
-        # Determine which side is the underdog (reverse token)
-        if up_price < down_price:
-            reverse_token, reverse_price = up_token, up_price
-            favorite_token, favorite_price = down_token, down_price
-            reverse_side = "up"
-            favorite_side = "down"
-        else:
-            reverse_token, reverse_price = down_token, down_price
-            favorite_token, favorite_price = up_token, up_price
-            reverse_side = "down"
-            favorite_side = "up"
-
-        # Place cheap orders on reverse (underdog) side
         for price in cheap_prices:
-            size = min(int(CHEAP_ORDER_USDC / max(price, 0.01)), MAX_SHARES_PER_ORDER)
-            if size >= 1:
-                orders.append({
-                    "token_id": reverse_token,
-                    "side": "BUY",
-                    "price": price,
-                    "size": size,
-                    "leg": reverse_side,
-                    "label": f"{reverse_side.capitalize()}@{price:.2f}",
-                    "order_type": "cheap",
-                })
-
-        # Place expensive orders on favorite side
-        for price in expensive_prices:
-            size = min(int(EXPENSIVE_ORDER_USDC / max(price, 0.01)), MAX_SHARES_PER_ORDER)
-            if size >= 1:
-                orders.append({
-                    "token_id": favorite_token,
-                    "side": "BUY",
-                    "price": price,
-                    "size": size,
-                    "leg": favorite_side,
-                    "label": f"{favorite_side.capitalize()}@{price:.2f}",
-                    "order_type": "expensive",
-                })
+            size = self._compute_size(CHEAP_ORDER_USDC, price)
+            orders.append({
+                "token_id": reverse_token,
+                "side": "BUY",
+                "price": price,
+                "size": size,
+                "leg": reverse_outcome,
+                "label": f"{reverse_outcome}@{price:.2f}",
+                "kind": "cheap",
+            })
 
         if not orders:
             return None
@@ -624,23 +984,34 @@ class Reverse15mSignals:
 class Reverse15mOrchestrator:
     """Main loop for 15-minute reverse bot on BTC/ETH Up/Down windows."""
 
-    def __init__(self):
+    def __init__(self, live: bool = False):
         self.fetcher = ClobFetcher()
         self.signals = Reverse15mSignals(self.fetcher)
-        self.portfolio = PolymarketPortfolio(INITIAL_CASH)
+        state_path = LIVE_STATE if live else PAPER_STATE
+        self.portfolio = PolymarketPortfolio(INITIAL_CASH, state_path=state_path)
+        self.live = live
+        self.trader: Optional[LiveTrader] = None
+        if live:
+            self.trader = LiveTrader()
+            self.portfolio.sync_cash_from_clob(self.trader.balance_usd)
         self._tick_count = 0
         self._running = True
-        self._equity_log = RUN_DIR / "equity_15m.jsonl"
+        self._equity_log = RUN_DIR / ("equity_15m_live.jsonl" if live else "equity_15m_paper.jsonl")
         self._placed_this_window: Dict[str, Set[str]] = {}
         self._active_window: Optional[str] = None
+        self._live_order_ids: List[str] = []  # track live order IDs
 
     def run(self):
+        mode = "LIVE" if self.live else "PAPER"
         logger.info("=" * 60)
-        logger.info("POLYMARKET 15-MINUTE REVERSE BOT (AUTO-REENTRY)")
-        logger.info(f"Capital: ${INITIAL_CASH} | Paper mode: True")
-        logger.info(f"Cheap: {CHEAP_BUY_MIN}-{CHEAP_BUY_MAX} | Expensive: {EXPENSIVE_BUY_MIN}-{EXPENSIVE_BUY_MAX}")
-        logger.info(f"Budgets: ${CHEAP_ORDER_USDC} cheap | ${EXPENSIVE_ORDER_USDC} expensive | Max: {MAX_SHARES_PER_ORDER} shares")
-        logger.info(f"Assets: {TARGET_ASSETS} | Tick: {REVERSE_15M_TICK}s")
+        logger.info(f"POLYMARKET 15-MINUTE REVERSE BOT — {mode} MODE")
+        if self.live:
+            logger.info(f"Deposit wallet: {LiveTrader.DEPOSIT_WALLET}")
+            logger.info(f"Balance: ${self.trader.balance_usd:.2f}")
+        else:
+            logger.info(f"Capital: ${self.portfolio.cash:.2f}")
+        logger.info(f"Cheap: {CHEAP_BUY_MIN}-{CHEAP_BUY_MAX} (${CHEAP_ORDER_USDC}/order) | Hedge: {ENABLE_EXPENSIVE_HEDGE} | Assets: {TARGET_ASSETS}")
+        logger.info(f"Max shares: {MAX_SHARES_PER_ORDER} | Hedge: {ENABLE_EXPENSIVE_HEDGE} | Assets: {TARGET_ASSETS}")
         logger.info("=" * 60)
 
         while self._running:
@@ -662,110 +1033,102 @@ class Reverse15mOrchestrator:
         if not markets:
             return
 
-        # Check for resolved positions
+        if self._tick_count % 6 == 0:
+            active = [p for p in self.portfolio.positions.values() if not p.get("resolved")]
+            logger.info(f"Tick {self._tick_count}: Cash=${self.portfolio.cash:.2f} Markets={len(markets)} Active={len(active)}")
+
         # Check for resolved positions (uses all markets including closed)
         all_markets = self.fetcher.get_all_15m_markets()
         self._check_resolved(all_markets)
 
-        # Find best OPEN market that generates valid signals
-        best_market = None
-        best_signal = None
+        # Live mode: check fills and cancel stale orders
+        if self.live and self.trader and self._tick_count % 12 == 0:
+            self._check_fills()
+
+        # Place orders on ALL qualifying markets (BTC + ETH on same window)
         for market in markets:
+            if self.portfolio.cash < 1.0:
+                break
+
             condition_id = market.get("conditionId", "")
             if not condition_id:
                 continue
 
-            # Skip closed markets
             if not market.get("acceptingOrders", False):
                 continue
 
-            # Skip if we already traded this window
             if condition_id in self._placed_this_window:
-                # Already have enough orders, skip
-                if len(self._placed_this_window.get(condition_id, set())) >= 10:
+                if len(self._placed_this_window.get(condition_id, set())) >= 20:
                     continue
 
-            # Try to generate signal — skip lopsided markets
             signal = self.signals.analyze_market(market)
-            if signal and signal["orders"]:
-                best_market = market
-                best_signal = signal
-                break
-
-        if not best_market or not best_signal:
-            return
-
-        condition_id = best_market.get("conditionId", "")
-        if condition_id not in self._placed_this_window:
-            self._placed_this_window[condition_id] = set()
-
-        signal = best_signal
-
-        # Track spending per side for this window
-        placed = self._placed_this_window[condition_id]
-        up_spent = sum(
-            o["price"] * o["size"]
-            for o in signal["orders"]
-            if o["leg"] == "up" and o["label"] in placed
-        )
-        down_spent = sum(
-            o["price"] * o["size"]
-            for o in signal["orders"]
-            if o["leg"] == "down" and o["label"] in placed
-        )
-
-        # Split cash 50/50 between sides
-        cash_per_side = self.portfolio.cash / 2
-
-        for order in signal["orders"]:
-            price_label = order["label"]
-
-            if price_label in placed:
+            if not signal or not signal["orders"]:
                 continue
 
-            if not self.portfolio.can_place_order(condition_id, price_label):
-                continue
+            if condition_id not in self._placed_this_window:
+                self._placed_this_window[condition_id] = set()
 
-            cost = order["price"] * order["size"]
-            side = order["leg"]
-            order_type = order.get("order_type", "cheap")
+            for order in signal["orders"]:
+                price_label = order["label"]
 
-            # Check budget per order type
-            if order_type == "cheap":
-                budget = CHEAP_ORDER_USDC
-            else:
-                budget = EXPENSIVE_ORDER_USDC
+                if price_label in self._placed_this_window[condition_id]:
+                    continue
 
-            # Track spending per type for this window
-            type_key = f"{condition_id}_{order_type}"
-            if not hasattr(self, '_type_spent'):
-                self._type_spent = {}
-            type_spent = self._type_spent.get(type_key, 0)
+                if not self.portfolio.can_place_order(condition_id, price_label):
+                    continue
 
-            if type_spent + cost > budget:
-                continue
+                if self.live and order["token_id"] in getattr(self, '_bad_tokens', set()):
+                    continue
 
-            if cost > self.portfolio.cash:
-                continue
+                cost = order["price"] * order["size"]
 
-            order_id = f"paper_{condition_id[:8]}_{price_label}"
-            self.portfolio.record_order(
-                condition_id=condition_id,
-                price_label=price_label,
-                cost=cost,
-                shares=order["size"],
-                question=signal["question"],
-                leg=order["leg"],
-                event_end=signal.get("event_end", ""),
-            )
-            placed.add(price_label)
-            self._type_spent[type_key] = type_spent + cost
+                if cost < 1.0 or order["size"] < 5:
+                    order["size"] = max(5, int(1.0 / order["price"]) + 1)
+                    cost = order["price"] * order["size"]
 
-            logger.info(
-                f"PLACED: {order_type.upper()} {order['leg'].upper()} {price_label} | "
-                f"{order['size']} shares @ ${order['price']:.2f} | "
-                f"Cost=${cost:.2f} | Cash=${self.portfolio.cash:.2f}"
-            )
+                if cost > self.portfolio.cash:
+                    continue
+
+                order_id = f"paper_{condition_id[:8]}_{price_label}"
+
+                live_order = None
+                if self.live and self.trader:
+                    live_order = self.trader.place_limit_buy(
+                        token_id=order["token_id"],
+                        price=order["price"],
+                        size=order["size"],
+                    )
+                    if live_order:
+                        self._live_order_ids.append(live_order["order_id"])
+                        order_id = live_order["order_id"]
+                    else:
+                        if not hasattr(self, '_bad_tokens'):
+                            self._bad_tokens = set()
+                        self._bad_tokens.add(order["token_id"])
+                        continue
+                elif not self.live:
+                    pass
+                else:
+                    continue
+
+                self.portfolio.record_order(
+                    condition_id=condition_id,
+                    price_label=price_label,
+                    cost=cost,
+                    shares=order["size"],
+                    question=signal["question"],
+                    leg=order["leg"],
+                    event_end=signal.get("event_end", ""),
+                    order_id=order_id if self.live else None,
+                )
+                self._placed_this_window[condition_id].add(price_label)
+
+                tag = "LIVE" if self.live else "PAPER"
+                logger.info(
+                    f"[{tag}] {order['leg'].upper()} {price_label} | "
+                    f"{order['size']} shares @ ${order['price']:.2f} | "
+                    f"Cost=${cost:.2f} | Cash=${self.portfolio.cash:.2f}"
+                )
 
         equity = self.portfolio.cash + self.portfolio.total_invested
         self._log_equity(equity)
@@ -849,7 +1212,8 @@ class Reverse15mOrchestrator:
 
             # Resolve this position
             label = pos.get("price_label", "")
-            if winning.lower() in label.lower():
+            is_winner = winning.lower() in label.lower()
+            if is_winner:
                 payout = pos["shares"] * 1.0
                 pnl = payout - pos["notional"]
             else:
@@ -866,11 +1230,112 @@ class Reverse15mOrchestrator:
             resolved_any = True
             logger.info(
                 f"RESOLVED: {pos['question'][:40]} | {pos['price_label']} | "
-                f"PnL=${pnl:+.2f} | Cash=${self.portfolio.cash:.2f}"
+                f"{'WIN' if is_winner else 'LOSS'} | PnL=${pnl:+.2f} | Cash=${self.portfolio.cash:.2f}"
             )
+
+            # Auto-redeem winning positions on-chain (converts shares → pUSD)
+            if is_winner and self.live and self.trader:
+                self._try_redeem(pos)
+
+            # RE-ENTRY: clear this window from tracker so we can trade the next one
+            condition_id = pos.get("condition_id", "")
+            if condition_id in self._placed_this_window:
+                del self._placed_this_window[condition_id]
+                logger.info(f"  [RE-ENTRY] Cleared window {condition_id[:12]}... — ready for next opportunity")
 
         if resolved_any:
             self._cleanup_old_windows()
+
+    def _try_redeem(self, pos: Dict):
+        """Attempt to redeem winning shares on-chain via CTF.redeemPositions."""
+        try:
+            from web3 import Web3
+            from web3.middleware import ExtraDataToPOAMiddleware
+
+            condition_id = pos.get("condition_id", "")
+            leg = pos.get("leg", "")
+            if not condition_id or not leg:
+                return
+
+            w3 = Web3(Web3.HTTPProvider("https://polygon-bor-rpc.publicnode.com", request_kwargs={"timeout": 15}))
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+
+            eoa = "0xbe2C534B73CEb53F2c16cb5954f5baE03F1f07Cf"
+            matic = w3.eth.get_balance(Web3.to_checksum_address(eoa))
+            if matic < w3.to_wei(0.05, "ether"):
+                logger.info(f"  [REDEEM] Skipped — need MATIC for gas (have {matic / 1e18:.4f})")
+                return
+
+            CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+            PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+            private_key = "09e99c8392099bf891f45a73d7854329486dd640bb857f2c245ec54ad7d27ac8"
+
+            REDEEM_ABI = [{"inputs":[
+                {"name":"collateralToken","type":"address"},
+                {"name":"parentCollectionId","type":"bytes32"},
+                {"name":"questionId","type":"bytes32"},
+                {"name":"outcomeIndexes","type":"uint256[]"}
+            ],"name":"redeemPositions","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+
+            ctf = w3.eth.contract(address=CTF, abi=REDEEM_ABI)
+            outcome_index = 0 if leg == "up" else 1
+
+            txn = ctf.functions.redeemPositions(
+                PUSD,
+                b'\x00' * 32,
+                bytes.fromhex(condition_id[2:]),
+                [outcome_index],
+            ).build_transaction({
+                "from": eoa,
+                "nonce": w3.eth.get_transaction_count(Web3.to_checksum_address(eoa)),
+                "gas": 200000,
+                "maxFeePerGas": w3.eth.gas_price,
+                "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
+                "chainId": 137,
+            })
+
+            signed = w3.eth.account.sign_transaction(txn, private_key)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            logger.info(f"  [REDEEM] TX sent: {tx_hash.hex()}")
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            if receipt["status"] == 1:
+                logger.info(f"  [REDEEM] SUCCESS — shares redeemed to pUSD")
+                self.trader.refresh_balance()
+                self.portfolio.sync_cash_from_clob(self.trader.balance_usd)
+            else:
+                logger.warning(f"  [REDEEM] FAILED on-chain")
+        except Exception as e:
+            logger.warning(f"  [REDEEM] Error: {e}")
+
+    def _check_fills(self):
+        """Check if any live orders have filled, cancel stale ones."""
+        if not self.trader:
+            return
+
+        try:
+            # Cancel orders older than 15 minutes
+            cancelled = self.trader.cancel_stale_orders(max_age_seconds=900)
+            if cancelled:
+                logger.info(f"  [FILLS] Cancelled {cancelled} stale orders")
+
+            # Refresh balance after fills
+            old_cash = self.portfolio.cash
+            self.trader.refresh_balance()
+            new_balance = self.trader.balance_usd
+            if abs(new_balance - old_cash) > 0.01:
+                logger.info(f"  [FILLS] Balance changed: ${old_cash:.2f} → ${new_balance:.2f}")
+                self.portfolio.sync_cash_from_clob(new_balance)
+
+            # Clean up order IDs for orders no longer open
+            open_orders = self.trader.get_open_orders()
+            open_ids = {o.get("id") for o in open_orders if isinstance(o, dict)}
+            filled = [oid for oid in self._live_order_ids if oid not in open_ids]
+            if filled:
+                logger.info(f"  [FILLS] {len(filled)} orders filled/closed")
+            self._live_order_ids = [oid for oid in self._live_order_ids if oid in open_ids]
+
+        except Exception as e:
+            logger.warning(f"  [FILLS] Error: {e}")
 
     def _cleanup_old_windows(self):
         """Remove closed windows from placed_this_window."""
@@ -923,20 +1388,26 @@ class Reverse15mOrchestrator:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PolymarketOrchestrator:
-    """Main loop for Polymarket paper trading."""
+    """Main loop for Polymarket V2 Reversed strategy — paper or live."""
 
-    def __init__(self):
+    def __init__(self, live: bool = False):
         self.fetcher = PolymarketFetcher()
         self.signals = ReversedSignals()
         self.portfolio = PolymarketPortfolio(INITIAL_CASH)
+        self.live = live
+        self.trader: Optional[LiveTrader] = None
+        if live:
+            self.trader = LiveTrader()
+            self.portfolio.sync_cash_from_clob(self.trader.balance_usd)
         self._tick_count = 0
         self._running = True
         self._equity_log = RUN_DIR / "equity.jsonl"
 
     def run(self):
+        mode = "LIVE" if self.live else "PAPER"
         logger.info("=" * 60)
-        logger.info("POLYMARKET V2 — REVERSED STRATEGY")
-        logger.info(f"Capital: ${INITIAL_CASH} | Max positions: {MAX_POSITIONS}")
+        logger.info(f"POLYMARKET V2 — REVERSED STRATEGY — {mode}")
+        logger.info(f"Capital: ${self.portfolio.cash:.2f} | Max positions: {MAX_POSITIONS}")
         logger.info(f"TP: {TAKE_PROFIT_PCT*100}% | SL: {STOP_LOSS_PCT*100}% | Max hold: 1h")
         logger.info("Strategy: Buy favorites YES, fade longshots NO")
         logger.info("=" * 60)
@@ -986,6 +1457,31 @@ class PolymarketOrchestrator:
 
             signal = self.signals.analyze_market(market)
             if signal["action"] == "BUY" and signal["confidence"] >= 60:
+                # Live order placement
+                if self.live and self.trader:
+                    # Get token_id from market
+                    outcomes_raw = market.get("outcomes", "[]")
+                    clob_ids_raw = market.get("clobTokenIds", "[]")
+                    outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                    clob_ids = json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
+
+                    if len(outcomes) == 2 and len(clob_ids) == 2:
+                        side_idx = 0 if signal["side"] == "YES" else 1
+                        token_id = clob_ids[side_idx]
+                        shares = max(5, int(signal["size_pct"] * self.portfolio.cash / signal["price"]))
+                        shares = min(shares, 90)
+
+                        if shares * signal["price"] >= 1.0 and shares * signal["price"] <= self.portfolio.cash:
+                            live_order = self.trader.place_limit_buy(
+                                token_id=token_id,
+                                price=signal["price"],
+                                size=shares,
+                            )
+                            if live_order:
+                                logger.info(f"[LIVE] {signal['side']} {signal['question'][:40]} | {shares} shares @ ${signal['price']:.3f}")
+                            else:
+                                continue
+
                 self.portfolio.buy(
                     condition_id=cond_id,
                     side=signal["side"],
@@ -1029,24 +1525,35 @@ class PolymarketOrchestrator:
 
 
 def main():
-    global INITIAL_CASH, TARGET_ASSETS, ENABLE_HEDGE
+    global INITIAL_CASH, TARGET_ASSETS
 
     import argparse
 
     parser = argparse.ArgumentParser(description="Polymarket V2 Paper Trader")
     parser.add_argument(
+        "--ultra-cheap-live",
+        action="store_true",
+        help="Run Ultra-Cheap Dislocation live (BTC/ETH 15m windows)",
+    )
+    parser.add_argument(
         "--reverse-15m",
         action="store_true",
         help="Run 15-minute reverse bot (BTC/ETH Up/Down windows)",
     )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="LIVE MODE — place real orders on Polymarket",
+    )
     parser.add_argument("--cash", type=float, default=INITIAL_CASH, help="Initial cash")
     parser.add_argument("--assets", nargs="+", default=TARGET_ASSETS, help="Assets for 15m bot")
-    parser.add_argument("--no-hedge", action="store_true", help="Disable hedge leg")
     args = parser.parse_args()
 
     INITIAL_CASH = args.cash
     TARGET_ASSETS = args.assets
-    ENABLE_HEDGE = not args.no_hedge
+
+    # Live only if --live flag passed; DRY_RUN=true forces paper
+    live = args.live and os.environ.get("DRY_RUN", "false").lower() != "true"
 
     log_file = "stdout_15m.log" if args.reverse_15m else "stdout.log"
     logging.basicConfig(
@@ -1058,10 +1565,12 @@ def main():
         ],
     )
 
-    if args.reverse_15m:
-        orchestrator = Reverse15mOrchestrator()
+    if args.ultra_cheap_live:
+        orchestrator = UltraCheapLiveOrchestrator(live=live)
+    elif args.reverse_15m:
+        orchestrator = Reverse15mOrchestrator(live=live)
     else:
-        orchestrator = PolymarketOrchestrator()
+        orchestrator = PolymarketOrchestrator(live=live)
 
     orchestrator.run()
 
