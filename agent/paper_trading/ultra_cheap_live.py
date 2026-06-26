@@ -109,10 +109,7 @@ class LiveTrader:
         self.host = CLOB_HOST
         self.chain_id = 137
         self.deposit_wallet = "0x3B4D8B57a729799a49ce259580cADaC29B4d1aB8"
-        self.private_key = os.environ.get(
-            "POLYMARKET_PRIVATE_KEY", 
-            "09e99c8392099bf891f45a73d7854329486dd640bb857f2c245ec54ad7d27ac8"
-        )
+        self.private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
         self._client = None
         self._init_client()
 

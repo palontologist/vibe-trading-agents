@@ -673,7 +673,7 @@ class LiveTrader:
     DEPOSIT_WALLET = "0x3B4D8B57a729799a49ce259580cADaC29B4d1aB8"
     PRIVATE_KEY = os.environ.get(
         "POLYMARKET_PRIVATE_KEY",
-        "09e99c8392099bf891f45a73d7854329486dd640bb857f2c245ec54ad7d27ac8",
+        os.environ.get("POLYMARKET_PRIVATE_KEY", ""),
     )
 
     def __init__(self):
@@ -1268,7 +1268,8 @@ class Reverse15mOrchestrator:
 
             CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
             PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
-            private_key = "09e99c8392099bf891f45a73d7854329486dd640bb857f2c245ec54ad7d27ac8"
+            private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+
 
             REDEEM_ABI = [{"inputs":[
                 {"name":"collateralToken","type":"address"},
